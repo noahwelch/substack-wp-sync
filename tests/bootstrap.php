@@ -26,6 +26,22 @@ if (! defined('ABSPATH')) {
 if (! defined('SUBSTACK_SYNC_PLUGIN_DIR')) {
     define('SUBSTACK_SYNC_PLUGIN_DIR', dirname(__DIR__) . '/');
 }
+if (! defined('MINUTE_IN_SECONDS')) {
+    define('MINUTE_IN_SECONDS', 60);
+}
+if (! defined('HOUR_IN_SECONDS')) {
+    define('HOUR_IN_SECONDS', 3600);
+}
+
+// process_post_images() require_onces these wp-admin files; give it empty ones.
+foreach (['wp-admin/includes/media.php', 'wp-admin/includes/file.php', 'wp-admin/includes/image.php'] as $fake_wp_file) {
+    $fake_wp_path = ABSPATH . $fake_wp_file;
+    if (! file_exists($fake_wp_path)) {
+        @mkdir(dirname($fake_wp_path), 0777, true);
+        file_put_contents($fake_wp_path, "<?php\n");
+    }
+}
+unset($fake_wp_file, $fake_wp_path);
 
 // --- WordPress sanitization stubs ---
 
@@ -264,6 +280,26 @@ if (! class_exists('wpdb')) {
             return null;
         }
 
+        public function get_results(string $query, $output = 'OBJECT'): array
+        {
+            return [];
+        }
+
+        public function get_col(string $query): array
+        {
+            return [];
+        }
+
+        public function query(string $query)
+        {
+            return 0;
+        }
+
+        public function delete(string $table, array $where, array $where_format = [])
+        {
+            return 0;
+        }
+
         public function replace(string $table, array $data, array $format = []): bool
         {
             return true;
@@ -284,8 +320,25 @@ if (! function_exists('add_action')) {
     function add_action(string $hook, $callback, int $priority = 10, int $accepted_args = 1): void {}
 }
 
+$_wp_added_filters = [];
+$_wp_removed_filters = [];
+
 if (! function_exists('add_filter')) {
-    function add_filter(string $hook, $callback, int $priority = 10, int $accepted_args = 1): void {}
+    function add_filter(string $hook, $callback, int $priority = 10, int $accepted_args = 1): void
+    {
+        global $_wp_added_filters;
+        $_wp_added_filters[] = $hook;
+    }
+}
+
+if (! function_exists('remove_filter')) {
+    function remove_filter(string $hook, $callback, int $priority = 10): bool
+    {
+        global $_wp_removed_filters;
+        $_wp_removed_filters[] = $hook;
+
+        return true;
+    }
 }
 
 if (! function_exists('register_setting')) {
@@ -363,7 +416,7 @@ if (! function_exists('get_categories')) {
 }
 
 if (! function_exists('wp_json_encode')) {
-    function wp_json_encode($data): string { return json_encode($data); }
+    function wp_json_encode($data, int $options = 0): string { return json_encode($data, $options); }
 }
 
 if (! function_exists('wp_send_json_success')) {
@@ -376,6 +429,87 @@ if (! function_exists('wp_send_json_error')) {
 
 if (! function_exists('wp_die')) {
     function wp_die(string $message = ''): void { throw new \RuntimeException($message); }
+}
+
+// --- Transient stubs ---
+
+$_wp_transients = [];
+$_wp_deleted_transients = [];
+
+if (! function_exists('get_transient')) {
+    function get_transient(string $transient)
+    {
+        global $_wp_transients;
+
+        return $_wp_transients[$transient] ?? false;
+    }
+}
+
+if (! function_exists('set_transient')) {
+    function set_transient(string $transient, $value, int $expiration = 0): bool
+    {
+        global $_wp_transients;
+        $_wp_transients[$transient] = $value;
+
+        return true;
+    }
+}
+
+if (! function_exists('delete_transient')) {
+    function delete_transient(string $transient): bool
+    {
+        global $_wp_transients, $_wp_deleted_transients;
+        $_wp_deleted_transients[] = $transient;
+        unset($_wp_transients[$transient]);
+
+        return true;
+    }
+}
+
+// --- Feed and media stubs ---
+
+if (! function_exists('fetch_feed')) {
+    function fetch_feed(string $url)
+    {
+        return new WP_Error('feed_error', 'stub fetch_feed: no network in tests');
+    }
+}
+
+$_wp_sideload_calls = [];
+$_wp_sideload_fail = false;
+$_wp_thumbnails = [];
+
+if (! function_exists('media_sideload_image')) {
+    function media_sideload_image(string $src, int $post_id = 0, ?string $desc = null, string $return_type = 'html')
+    {
+        global $_wp_sideload_calls, $_wp_sideload_fail, $_wp_post_id_counter;
+        $_wp_sideload_calls[] = $src;
+
+        if ($_wp_sideload_fail) {
+            return new WP_Error('sideload_failed', 'stub sideload failure');
+        }
+
+        return $_wp_post_id_counter++;
+    }
+}
+
+if (! function_exists('set_post_thumbnail')) {
+    function set_post_thumbnail($post, int $attachment_id): bool
+    {
+        global $_wp_thumbnails;
+        $_wp_thumbnails[(int) (is_object($post) ? $post->ID : $post)] = $attachment_id;
+
+        return true;
+    }
+}
+
+if (! function_exists('has_post_thumbnail')) {
+    function has_post_thumbnail($post = null): bool
+    {
+        global $_wp_thumbnails;
+
+        return isset($_wp_thumbnails[(int) (is_object($post) ? $post->ID : $post)]);
+    }
 }
 
 // --- Other stubs ---

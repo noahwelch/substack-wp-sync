@@ -13,7 +13,7 @@ This plugin is provided "as is" without warranty of any kind. The author is not 
 - **Author:** Christopher S. Penn
 - **Email:** cspenn@gmail.com
 - **Website:** https://www.christopherspenn.com/
-- **Version:** 1.0.2
+- **Version:** 1.1.0
 - **Date:** August 10, 2025
 - **License:** Apache-2.0
 
@@ -25,7 +25,7 @@ Substack Sync for WordPress is designed for creators who use Substack as their p
 
 - **Automated Synchronization:** Hourly cron job fetches new content from Substack RSS feed
 - **Intelligent Content Management:** Imports new posts and updates existing ones with GUID-based tracking
-- **Advanced Media Handling:** Downloads and imports images to WordPress Media Library with automatic featured image assignment
+- **Featured Image Handling:** Sideloads the first usable image from each post into the Media Library and sets it as the featured image
 - **Batch Processing:** Progressive sync system with detailed progress tracking and real-time status updates
 - **Error Handling & Retry Logic:** Automatic retry system for failed imports (up to 3 attempts) with detailed error logging
 - **Content Processing:** Removes Substack-specific elements and replaces with customizable subscription links
@@ -71,7 +71,7 @@ Navigate to **Settings > Substack Sync** in your WordPress admin to configure:
 
 - WordPress 6.0 or higher
 - PHP 8.0 or higher
-- Tested up to WordPress 6.6
+- Tested up to WordPress 7.0
 
 ## Development
 
@@ -120,7 +120,7 @@ substack-sync/
 3. **GUID Tracking:** Compares Substack post GUIDs against database to identify new/updated content
 4. **Batch Processing:** Processes posts individually with real-time progress tracking
 5. **Content Import:** Creates new WordPress posts or updates existing ones based on GUID matching
-6. **Media Handling:** Downloads images via `media_sideload_image()` and sets featured images automatically
+6. **Media Handling:** Sideloads the first usable image via `media_sideload_image()` and sets it as the featured image (skipped once a post has one)
 7. **Content Processing:** Removes Substack-specific elements (subscription boxes, like buttons) and adds custom subscription links
 8. **Category Assignment:** Applies keyword-based category mapping if configured
 9. **Error Handling:** Logs failures with detailed error messages and retry tracking
