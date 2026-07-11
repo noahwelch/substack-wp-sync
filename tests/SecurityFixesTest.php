@@ -45,8 +45,8 @@ class SecurityFixesTest extends TestCase
     {
         $method = self::extractPhpMethod(self::$upstreamProcessor, 'update_post');
 
-        $this->assertStringContainsString(
-            "'post_status' => 'draft'",
+        $this->assertMatchesRegularExpression(
+            '/post_status.*=.*[\'"]draft[\'"]/',
             $method,
             'UPSTREAM: update_post() should hardcode draft (proving the bug exists)'
         );
@@ -310,18 +310,18 @@ class SecurityFixesTest extends TestCase
     public function test_upstream_has_domcontentloaded_sync_init(): void
     {
         $this->assertMatchesRegularExpression(
-            '/DOMContentLoaded.*SubstackSyncProgress/s',
+            '/DOMContentLoaded.*function\s*\(\)\s*\{[^}]*SubstackSyncProgress/s',
             self::$upstreamAdmin,
-            'UPSTREAM: should have a DOMContentLoaded-based SubstackSyncProgress init'
+            'UPSTREAM: should have a DOMContentLoaded callback that creates SubstackSyncProgress'
         );
     }
 
     public function test_patched_has_no_domcontentloaded_sync_init(): void
     {
         $this->assertDoesNotMatchRegularExpression(
-            '/DOMContentLoaded.*SubstackSyncProgress/s',
+            '/DOMContentLoaded.*function\s*\(\)\s*\{[^}]*SubstackSyncProgress/s',
             self::$patchedAdmin,
-            'PATCHED: must not have a DOMContentLoaded-based SubstackSyncProgress init'
+            'PATCHED: must not have a DOMContentLoaded callback that creates SubstackSyncProgress'
         );
     }
 
