@@ -4,8 +4,16 @@ declare(strict_types=1);
 
 /**
  * Test bootstrap: stubs for WordPress functions so tests can run without
- * a full WordPress installation. Each stub faithfully reproduces the
- * behavior the production code relies on.
+ * a full WordPress installation.
+ *
+ * These stubs approximate the security-relevant behavior of the real
+ * WordPress functions, not their full implementation. Where a test depends
+ * on a specific sanitization guarantee (tag removal, event-handler and
+ * javascript: URI stripping on allowed tags), the stub reproduces that
+ * guarantee so the assertion is meaningful. They are NOT a substitute for
+ * running the suite against a real WordPress install, and any test that
+ * relies on kses behavior beyond what is stubbed here would give false
+ * confidence.
  */
 
 // WordPress constants
@@ -31,7 +39,13 @@ if (! function_exists('sanitize_text_field')) {
 if (! function_exists('wp_kses_post')) {
     function wp_kses_post(string $content): string
     {
-        return strip_tags($content, '<p><a><strong><em><ul><ol><li><br><h1><h2><h3><h4><h5><h6><blockquote><img><div><span><table><tr><td><th><thead><tbody><figure><figcaption>');
+        // Drop disallowed tags (scripts, iframes, embeds) entirely.
+        $content = strip_tags($content, '<p><a><strong><em><ul><ol><li><br><h1><h2><h3><h4><h5><h6><blockquote><img><div><span><table><tr><td><th><thead><tbody><figure><figcaption>');
+        // On the tags we keep, strip the attribute-level vectors real
+        // wp_kses_post also removes: inline event handlers and script: URIs.
+        $content = preg_replace('/\son\w+\s*=\s*("[^"]*"|\'[^\']*\'|[^\s>]+)/i', '', $content);
+        $content = preg_replace('/(href|src)\s*=\s*("|\')?\s*(javascript|vbscript|data):[^"\'>\s]*("|\')?/i', '$1=""', $content);
+        return $content;
     }
 }
 

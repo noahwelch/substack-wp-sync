@@ -203,6 +203,22 @@ class SecurityFixesTest extends TestCase
         $this->assertStringNotContainsString('<script>', $sanitized);
         $this->assertStringContainsString('<p>Hello</p>', $sanitized);
 
+        // Attribute-level vectors on tags that survive the tag allowlist: real
+        // wp_kses_post strips inline event handlers and script: URIs. strip_tags
+        // alone would keep these, so this asserts the stub (and prod) go further.
+        $eventHandler = '<a href="#" onclick="alert(1)">click</a>';
+        $sanitized = wp_kses_post($eventHandler);
+        $this->assertStringNotContainsString('onclick', $sanitized, 'Inline event handlers must be stripped from allowed tags');
+        $this->assertStringContainsString('click', $sanitized, 'Link text must survive');
+
+        $imgHandler = '<img src="x" onerror="alert(1)">';
+        $sanitized = wp_kses_post($imgHandler);
+        $this->assertStringNotContainsString('onerror', $sanitized, 'onerror must be stripped from <img>');
+
+        $jsUri = '<a href="javascript:alert(1)">x</a>';
+        $sanitized = wp_kses_post($jsUri);
+        $this->assertStringNotContainsString('javascript:', $sanitized, 'javascript: URIs must be neutralized on allowed tags');
+
         $xssTitle = 'Post Title<img src=x onerror=alert(1)>';
         $sanitized = sanitize_text_field($xssTitle);
         $this->assertStringNotContainsString('<img', $sanitized);
@@ -249,7 +265,7 @@ class SecurityFixesTest extends TestCase
         ]);
 
         $this->assertEmpty($result['feed_url'], 'javascript: URLs must be rejected');
-        $this->assertEquals(0, $result['default_author'], 'Non-numeric author must become 0');
+        $this->assertEquals(1, $result['default_author'], 'Non-numeric/non-positive author must fall back to the default user (1), never 0');
         $this->assertEquals('draft', $result['default_post_status'], 'Invalid status must fall back to draft');
         $this->assertCount(1, $result['category_mapping'], 'Only the valid mapping should survive');
         $this->assertEquals('valid', $result['category_mapping'][0]['keyword']);
@@ -278,6 +294,45 @@ class SecurityFixesTest extends TestCase
         $this->assertEquals('theology', $result['category_mapping'][0]['keyword']);
     }
 
+    public function test_sanitize_settings_tolerates_non_array_input(): void
+    {
+        $admin = new Substack_Sync_Admin();
+
+        // WordPress invokes the sanitize_callback on every update_option for the
+        // option, and options.php passes null when the key is absent from $_POST.
+        // A strict array type hint would fatal here; the callback must coerce.
+        foreach ([null, '', 'unexpected string', 42, false] as $bad) {
+            $result = $admin->sanitize_settings($bad);
+            $this->assertIsArray($result, 'Non-array input must yield a sanitized array, not a fatal');
+            $this->assertSame('', $result['feed_url']);
+            $this->assertSame(1, $result['default_author']);
+            $this->assertSame('draft', $result['default_post_status']);
+            $this->assertSame([], $result['category_mapping']);
+        }
+    }
+
+    public function test_sanitize_settings_tolerates_array_valued_fields(): void
+    {
+        $admin = new Substack_Sync_Admin();
+
+        // Crafted POST bodies can send scalars as arrays (feed_url[]=x). These
+        // must not reach esc_url_raw()/sanitize_text_field() as arrays (a fatal).
+        $result = $admin->sanitize_settings([
+            'feed_url' => ['https://evil.example/feed'],
+            'default_author' => ['3'],
+            'category_mapping' => [
+                ['keyword' => ['array'], 'category' => ['5']],
+                'not-an-array',
+                ['keyword' => 'valid', 'category' => '3'],
+            ],
+        ]);
+
+        $this->assertSame('', $result['feed_url'], 'Array feed_url must be rejected, not fatal');
+        $this->assertSame(1, $result['default_author'], 'Array author must fall back to default');
+        $this->assertCount(1, $result['category_mapping'], 'Only the well-formed mapping survives');
+        $this->assertSame('valid', $result['category_mapping'][0]['keyword']);
+    }
+
     // ---------------------------------------------------------------
     // 5. Triple SubstackSyncProgress instantiation
     //
@@ -298,30 +353,18 @@ class SecurityFixesTest extends TestCase
 
     public function test_patched_has_exactly_one_sync_progress_instantiation(): void
     {
+        // The instantiation count is the reliable signal for this fix. The
+        // patched code still (correctly) creates SubstackSyncProgress inside the
+        // main DOMContentLoaded handler, gated on #sync-now-btn; only the two
+        // redundant, ungated inits were removed. A regex asserting "no
+        // DOMContentLoaded creates it" would misrepresent the code (and pass only
+        // by accident of intervening braces), so we assert the count instead.
         $count = substr_count(self::$patchedAdmin, 'new SubstackSyncProgress()');
 
         $this->assertEquals(
             1,
             $count,
             "PATCHED: must have exactly one SubstackSyncProgress() instantiation (found {$count})"
-        );
-    }
-
-    public function test_upstream_has_domcontentloaded_sync_init(): void
-    {
-        $this->assertMatchesRegularExpression(
-            '/DOMContentLoaded.*function\s*\(\)\s*\{[^}]*SubstackSyncProgress/s',
-            self::$upstreamAdmin,
-            'UPSTREAM: should have a DOMContentLoaded callback that creates SubstackSyncProgress'
-        );
-    }
-
-    public function test_patched_has_no_domcontentloaded_sync_init(): void
-    {
-        $this->assertDoesNotMatchRegularExpression(
-            '/DOMContentLoaded.*function\s*\(\)\s*\{[^}]*SubstackSyncProgress/s',
-            self::$patchedAdmin,
-            'PATCHED: must not have a DOMContentLoaded callback that creates SubstackSyncProgress'
         );
     }
 

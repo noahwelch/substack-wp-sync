@@ -106,20 +106,35 @@ class Substack_Sync_Admin
     /**
      * Sanitize settings before saving.
      *
-     * @param array<string, mixed> $input Raw settings input.
+     * Registered as the sanitize_callback on register_setting(), so this fires
+     * on every add_option/update_option for the option, not just the settings
+     * form. WordPress can hand it a non-array value (e.g. options.php passes
+     * null when the option key is absent from $_POST), so the parameter is left
+     * untyped and coerced here rather than relying on a strict array hint that
+     * would fatal under declare(strict_types=1).
+     *
+     * @param mixed $input Raw settings input (array from the form, but not guaranteed).
      * @return array<string, mixed> Sanitized settings.
      */
-    public function sanitize_settings(array $input): array
+    public function sanitize_settings($input): array
     {
+        if (! is_array($input)) {
+            $input = [];
+        }
+
         $sanitized = [];
 
-        $sanitized['feed_url'] = isset($input['feed_url'])
+        $sanitized['feed_url'] = isset($input['feed_url']) && is_string($input['feed_url'])
             ? esc_url_raw($input['feed_url'])
             : '';
 
-        $sanitized['default_author'] = isset($input['default_author'])
-            ? absint($input['default_author'])
+        // wp_dropdown_users() emits value="-1" for its "none" option. Treat any
+        // non-positive or non-scalar selection as the default author (1) rather
+        // than letting absint() silently flip -1 into user ID 1.
+        $author = isset($input['default_author']) && is_scalar($input['default_author'])
+            ? (int) $input['default_author']
             : 1;
+        $sanitized['default_author'] = $author > 0 ? $author : 1;
 
         $allowed_statuses = ['draft', 'publish'];
         $sanitized['default_post_status'] = isset($input['default_post_status']) && in_array($input['default_post_status'], $allowed_statuses, true)
@@ -131,8 +146,11 @@ class Substack_Sync_Admin
         $sanitized['category_mapping'] = [];
         if (!empty($input['category_mapping']) && is_array($input['category_mapping'])) {
             foreach ($input['category_mapping'] as $mapping) {
-                $keyword = sanitize_text_field($mapping['keyword'] ?? '');
-                $category = absint($mapping['category'] ?? 0);
+                if (! is_array($mapping)) {
+                    continue;
+                }
+                $keyword = is_scalar($mapping['keyword'] ?? null) ? sanitize_text_field((string) $mapping['keyword']) : '';
+                $category = absint(is_scalar($mapping['category'] ?? null) ? $mapping['category'] : 0);
                 if ($keyword !== '' && $category > 0) {
                     $sanitized['category_mapping'][] = [
                         'keyword' => $keyword,
@@ -601,7 +619,17 @@ class Substack_Sync_Admin
                         warning: '#ffb900'
                     };
                     
-                    element.innerHTML = `<div style="padding: 10px; border-left: 4px solid ${colors[type] || '#0073aa'}; background: #f9f9f9; margin: 10px 0;">${message}</div>`;
+                    // Build the node instead of assigning innerHTML: `message` may
+                    // carry server payloads derived from feed content, so it must
+                    // reach the DOM as text, never as parsed HTML.
+                    element.textContent = '';
+                    const box = document.createElement('div');
+                    box.style.padding = '10px';
+                    box.style.borderLeft = `4px solid ${colors[type] || '#0073aa'}`;
+                    box.style.background = '#f9f9f9';
+                    box.style.margin = '10px 0';
+                    box.textContent = message;
+                    element.appendChild(box);
                 }
 
                 getLogColor(status) {

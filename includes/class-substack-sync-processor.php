@@ -404,6 +404,10 @@ class Substack_Sync_Processor
      */
     private function prepare_post_data($item): array
     {
+        // Sanitize unconditionally with wp_kses_post so cron imports (user 0)
+        // and admin-triggered imports (an admin with unfiltered_html, for whom
+        // core skips kses) store the exact same content. Substack RSS is
+        // untrusted; this strips scripts and embeds on both paths alike.
         $content = wp_kses_post($this->process_content($item->get_content()));
         $title = sanitize_text_field($item->get_title());
 
@@ -442,9 +446,14 @@ class Substack_Sync_Processor
             esc_url($this->settings['feed_url'] ?? '')
         );
 
-        // Remove or replace Substack interactive elements
-        $content = preg_replace('/<div[^>]*class="[^"]*subscription[^"]*"[^>]*>.*?<\/div>/is', $subscription_link, $content);
-        $content = preg_replace('/<div[^>]*class="[^"]*like-button[^"]*"[^>]*>.*?<\/div>/is', '', $content);
+        // Remove or replace Substack interactive elements. preg_replace returns
+        // null on PCRE failure (e.g. backtrack limit exhausted by pathological
+        // feed markup); fall back to the prior content so the next call is never
+        // handed null (a TypeError on PHP 8.1+) and we don't silently blank the post.
+        $replaced = preg_replace('/<div[^>]*class="[^"]*subscription[^"]*"[^>]*>.*?<\/div>/is', $subscription_link, $content);
+        $content = $replaced ?? $content;
+        $replaced = preg_replace('/<div[^>]*class="[^"]*like-button[^"]*"[^>]*>.*?<\/div>/is', '', $content);
+        $content = $replaced ?? $content;
 
         return $content;
     }
