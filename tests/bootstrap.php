@@ -88,6 +88,13 @@ if (! function_exists('absint')) {
     }
 }
 
+if (! function_exists('wp_parse_url')) {
+    function wp_parse_url(string $url, int $component = -1)
+    {
+        return parse_url($url, $component);
+    }
+}
+
 if (! function_exists('wp_strip_all_tags')) {
     function wp_strip_all_tags(string $content): string
     {

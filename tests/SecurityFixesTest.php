@@ -388,6 +388,51 @@ class SecurityFixesTest extends TestCase
     }
 
     // ---------------------------------------------------------------
+    // SSRF guard: hard-block internal targets, fail open when DNS is
+    // inconclusive so a locked-down resolver can't drop legitimate images.
+    // ---------------------------------------------------------------
+
+    public function test_is_safe_remote_url_blocks_internal_targets(): void
+    {
+        $unsafe = [
+            'http://127.0.0.1/x.png',                       // loopback literal
+            'http://169.254.169.254/latest/meta-data/',     // cloud metadata
+            'http://10.0.0.5/x.png',                        // rfc1918 10/8
+            'https://192.168.1.10/x.png',                   // rfc1918 192.168
+            'http://localhost/x.png',                       // localhost host
+            'http://printer.local/x.png',                   // .local host
+            'ftp://example.com/x.png',                      // non-http scheme
+            'javascript:alert(1)',                          // javascript scheme
+            'http://user:pass@example.com/x.png',           // embedded creds
+        ];
+
+        foreach ($unsafe as $url) {
+            $this->assertFalse($this->invokeIsSafeRemoteUrl($url), "Must reject: {$url}");
+        }
+    }
+
+    public function test_is_safe_remote_url_allows_public_ip_literal(): void
+    {
+        $this->assertTrue($this->invokeIsSafeRemoteUrl('https://8.8.8.8/x.png'));
+    }
+
+    public function test_is_safe_remote_url_fails_open_when_dns_inconclusive(): void
+    {
+        // A reserved .invalid host never resolves (RFC 2606), standing in for a
+        // disabled/empty resolver. The guard must fail OPEN (allow), so a
+        // locked-down resolver does not silently drop every legitimate image.
+        $this->assertTrue($this->invokeIsSafeRemoteUrl('https://substack-cdn.invalid/x.png'));
+    }
+
+    private function invokeIsSafeRemoteUrl(string $url): bool
+    {
+        $processor = new Substack_Sync_Processor();
+        $method = new ReflectionMethod($processor, 'is_safe_remote_url');
+
+        return $method->invoke($processor, $url);
+    }
+
+    // ---------------------------------------------------------------
     // 5. Triple SubstackSyncProgress instantiation
     //
     // Three code paths each created new SubstackSyncProgress(), so

@@ -527,11 +527,14 @@ class Substack_Sync_Processor
     /**
      * Whether a URL is safe to fetch server-side.
      *
-     * Requires an http(s) scheme, no embedded credentials, and a host that
-     * resolves only to public IP addresses (no private, reserved, loopback, or
-     * link-local ranges). Best-effort SSRF guard for untrusted feed content;
-     * it cannot defeat DNS-rebinding, but blocks the direct internal-target
-     * and cloud-metadata cases.
+     * Best-effort SSRF guard for untrusted feed content. It hard-blocks the
+     * cases it can prove are internal (non-http(s) schemes, embedded
+     * credentials, IP-literal or resolved private/reserved/loopback/link-local
+     * targets, and obvious internal hostnames), but FAILS OPEN when DNS
+     * resolution is inconclusive, e.g. dns_get_record is in disable_functions
+     * or the resolver returns nothing. Failing open is deliberate: silently
+     * dropping every legitimate image on a locked-down resolver is worse than
+     * this guard's residual gap, and it cannot defeat DNS-rebinding anyway.
      *
      * @param string $url The candidate image URL.
      * @return bool True when the URL is safe to sideload.
@@ -550,34 +553,37 @@ class Substack_Sync_Processor
             return false;
         }
 
-        $host = $parts['host'];
-        $ips = [];
+        $host = strtolower($parts['host']);
 
+        // Hard block: IP literals in private/reserved/loopback/link-local ranges.
         if (filter_var($host, FILTER_VALIDATE_IP)) {
-            $ips[] = $host;
-        } else {
-            if (strtolower($host) === 'localhost' || substr(strtolower($host), -6) === '.local') {
-                return false;
-            }
-            $records = @dns_get_record($host, DNS_A | DNS_AAAA);
-            if (is_array($records)) {
-                foreach ($records as $record) {
-                    if (! empty($record['ip'])) {
-                        $ips[] = $record['ip'];
-                    } elseif (! empty($record['ipv6'])) {
-                        $ips[] = $record['ipv6'];
-                    }
-                }
-            }
+            return (bool) filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE);
         }
 
-        // If we cannot resolve the host to any address, refuse rather than
-        // hand an unverifiable target to download_url().
-        if (empty($ips)) {
+        // Hard block: obvious internal hostnames.
+        if ($host === 'localhost' || substr($host, -6) === '.local' || substr($host, -10) === '.localhost') {
             return false;
         }
 
-        foreach ($ips as $ip) {
+        // Best-effort resolution. If the resolver is unavailable (function
+        // disabled) or returns nothing, fail open rather than drop the image.
+        if (! function_exists('dns_get_record')) {
+            return true;
+        }
+
+        $records = @dns_get_record($host, DNS_A | DNS_AAAA);
+        if (! is_array($records) || $records === []) {
+            return true;
+        }
+
+        // Reject only when we positively resolve the host to a non-public
+        // address; anything else (all-public, or records with no usable IP)
+        // is allowed.
+        foreach ($records as $record) {
+            $ip = $record['ip'] ?? ($record['ipv6'] ?? '');
+            if ($ip === '') {
+                continue;
+            }
             if (! filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
                 return false;
             }
