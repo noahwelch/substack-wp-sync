@@ -11,6 +11,9 @@ declare(strict_types=1);
  * NO SUPPORT PROVIDED. USE AT YOUR OWN RISK.
  */
 
+// If this file is called directly, abort.
+defined('ABSPATH') || exit;
+
 /**
  * The admin-specific functionality of the plugin.
  *
@@ -150,7 +153,10 @@ class Substack_Sync_Admin
                     continue;
                 }
                 $keyword = is_scalar($mapping['keyword'] ?? null) ? sanitize_text_field((string) $mapping['keyword']) : '';
-                $category = absint(is_scalar($mapping['category'] ?? null) ? $mapping['category'] : 0);
+                // Use (int) + a sign check, not absint(): absint() would strip
+                // the sign and turn a negative category ID into a valid positive
+                // one (the same footgun guarded against for default_author above).
+                $category = is_scalar($mapping['category'] ?? null) ? (int) $mapping['category'] : 0;
                 if ($keyword !== '' && $category > 0) {
                     $sanitized['category_mapping'][] = [
                         'keyword' => $keyword,
@@ -899,8 +905,13 @@ class Substack_Sync_Admin
             } else {
                 wp_send_json_error($result['error']);
             }
-        } catch (Exception $e) {
-            wp_send_json_error($e->getMessage());
+        } catch (Throwable $e) {
+            // Catch Throwable, not just Exception: a TypeError/Error here would
+            // otherwise escape as an uncaught fatal. Log the raw message (which
+            // for Error/TypeError embeds the absolute server path) and return a
+            // generic one so the path is never disclosed in the response.
+            error_log('Substack Sync Sync Error: ' . $e->getMessage());
+            wp_send_json_error(['message' => 'Sync failed. Check the server error log for details.']);
         }
     }
 
@@ -935,9 +946,12 @@ class Substack_Sync_Admin
             // Ensure clean JSON response
             wp_send_json_success($result);
         } catch (Throwable $e) {
+            // Log the raw message but return a generic one: an Error/TypeError
+            // message embeds the absolute server path, re-leaking exactly what
+            // stripping the debug fields from this response set out to close.
             error_log('Substack Sync AJAX Error: ' . $e->getMessage());
             wp_send_json_error([
-                'message' => 'Sync error: ' . $e->getMessage(),
+                'message' => 'Sync error. Check the server error log for details.',
                 'has_more' => false,
             ]);
         }
@@ -986,7 +1000,7 @@ class Substack_Sync_Admin
             ]);
         } catch (Throwable $e) {
             error_log('Substack Sync Retry Error: ' . $e->getMessage());
-            wp_send_json_error(['message' => 'Retry error: ' . $e->getMessage()]);
+            wp_send_json_error(['message' => 'Retry error. Check the server error log for details.']);
         }
     }
 
@@ -1044,7 +1058,7 @@ class Substack_Sync_Admin
             ]);
         } catch (Throwable $e) {
             error_log('Substack Sync Rollback Error: ' . $e->getMessage());
-            wp_send_json_error(['message' => 'Rollback error: ' . $e->getMessage()]);
+            wp_send_json_error(['message' => 'Rollback error. Check the server error log for details.']);
         }
     }
 
@@ -1077,7 +1091,7 @@ class Substack_Sync_Admin
             ]);
         } catch (Throwable $e) {
             error_log('Substack Sync Stats Error: ' . $e->getMessage());
-            wp_send_json_error(['message' => 'Stats error: ' . $e->getMessage()]);
+            wp_send_json_error(['message' => 'Stats error. Check the server error log for details.']);
         }
     }
 }

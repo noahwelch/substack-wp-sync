@@ -333,6 +333,60 @@ class SecurityFixesTest extends TestCase
         $this->assertSame('valid', $result['category_mapping'][0]['keyword']);
     }
 
+    public function test_sanitize_settings_rejects_negative_category(): void
+    {
+        $admin = new Substack_Sync_Admin();
+
+        // A negative category id must be rejected outright, not abs-flipped by
+        // absint() into a valid positive id pointing at an unintended category.
+        $result = $admin->sanitize_settings([
+            'category_mapping' => [
+                ['keyword' => 'neg-string', 'category' => '-5'],
+                ['keyword' => 'neg-int', 'category' => -1],
+                ['keyword' => 'ok', 'category' => '4'],
+            ],
+        ]);
+
+        $this->assertCount(1, $result['category_mapping'], 'Only the positive-id mapping should survive');
+        $this->assertSame('ok', $result['category_mapping'][0]['keyword']);
+        $this->assertSame(4, $result['category_mapping'][0]['category']);
+    }
+
+    // ---------------------------------------------------------------
+    // Re-review fixes: category keyword "0" asymmetry and date-range validation
+    // ---------------------------------------------------------------
+
+    public function test_apply_category_mapping_honors_zero_keyword(): void
+    {
+        // Sanitizer accepts a keyword of "0" (strict !== ''); the consumer must
+        // honor it too rather than dropping it via empty('0') === true.
+        update_option('substack_sync_settings', [
+            'category_mapping' => [
+                ['keyword' => '0', 'category' => 5],
+                ['keyword' => 'widget', 'category' => 7],
+            ],
+        ]);
+
+        $processor = new Substack_Sync_Processor();
+        $method = new ReflectionMethod($processor, 'apply_category_mapping');
+
+        $categories = $method->invoke($processor, 'this post mentions 0 and widget stuff');
+
+        $this->assertContains(5, $categories, 'Keyword "0" must match, not be silently dropped');
+        $this->assertContains(7, $categories);
+    }
+
+    public function test_rollback_posts_by_date_rejects_invalid_dates(): void
+    {
+        $processor = new Substack_Sync_Processor();
+
+        // Malformed/empty dates must short-circuit to 0 before any $wpdb query,
+        // never building nonsense BETWEEN bounds that delete unintended rows.
+        $this->assertSame(0, $processor->rollback_posts_by_date('', ''));
+        $this->assertSame(0, $processor->rollback_posts_by_date('not-a-date', '2026-01-01'));
+        $this->assertSame(0, $processor->rollback_posts_by_date('2026-13-99', '2026-01-01'));
+    }
+
     // ---------------------------------------------------------------
     // 5. Triple SubstackSyncProgress instantiation
     //

@@ -30,10 +30,10 @@ define('SUBSTACK_SYNC_PLUGIN_DIR', plugin_dir_path(__FILE__));
 /**
  * The code that runs during plugin activation.
  */
-function activate_substack_sync(): void
+function activate_substack_sync($network_wide = false): void
 {
     require_once SUBSTACK_SYNC_PLUGIN_DIR . 'includes/class-substack-sync-activator.php';
-    Substack_Sync_Activator::activate();
+    Substack_Sync_Activator::activate((bool) $network_wide);
 }
 
 /**

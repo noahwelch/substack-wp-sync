@@ -383,3 +383,4 @@ if (! function_exists('current_time')) {
 // --- Load plugin classes ---
 
 require_once dirname(__DIR__) . '/admin/class-substack-sync-admin.php';
+require_once dirname(__DIR__) . '/includes/class-substack-sync-processor.php';

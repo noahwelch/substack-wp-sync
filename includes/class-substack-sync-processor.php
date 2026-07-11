@@ -11,6 +11,9 @@ declare(strict_types=1);
  * NO SUPPORT PROVIDED. USE AT YOUR OWN RISK.
  */
 
+// If this file is called directly, abort.
+defined('ABSPATH') || exit;
+
 /**
  * The core plugin class for processing Substack content.
  *
@@ -116,7 +119,7 @@ class Substack_Sync_Processor
                             break;
                     }
                 }
-            } catch (Exception $e) {
+            } catch (Throwable $e) {
                 error_log('Substack Sync: Error processing post - ' . $e->getMessage());
                 $errors[] = $e->getMessage();
                 $posts_processed++;
@@ -237,7 +240,7 @@ class Substack_Sync_Processor
                 $result = $this->process_feed_item($item, true);
                 $posts_processed++;
                 $processed_posts[] = $result;
-            } catch (Exception $e) {
+            } catch (Throwable $e) {
                 error_log('Substack Sync: Error processing post - ' . $e->getMessage());
                 $errors[] = $e->getMessage();
                 $posts_processed++;
@@ -404,23 +407,36 @@ class Substack_Sync_Processor
      */
     private function prepare_post_data($item): array
     {
+        // SimplePie returns null (not '') for an item with no body/title, e.g. a
+        // link- or image-only Substack post. Coerce to '' so the strictly-typed
+        // process_content()/sanitize helpers below never receive null (a fatal
+        // TypeError under declare(strict_types=1)).
         // Sanitize unconditionally with wp_kses_post so cron imports (user 0)
         // and admin-triggered imports (an admin with unfiltered_html, for whom
         // core skips kses) store the exact same content. Substack RSS is
         // untrusted; this strips scripts and embeds on both paths alike.
-        $content = wp_kses_post($this->process_content($item->get_content()));
-        $title = sanitize_text_field($item->get_title());
+        $content = wp_kses_post($this->process_content($item->get_content() ?? ''));
+        $title = sanitize_text_field($item->get_title() ?? '');
 
         // Apply category mapping based on content and title
         $full_text = $title . ' ' . $content;
         $categories = $this->apply_category_mapping($full_text);
+
+        // A feed pubDate in the future makes wp_insert_post() silently flip
+        // post_status from the configured value to 'future' (scheduled),
+        // overriding the admin's Draft/Published choice. Cap it at "now" (and
+        // fall back to now when the feed omits a date) so the choice is honored.
+        $post_date = $item->get_date('Y-m-d H:i:s');
+        if (empty($post_date) || strtotime($post_date) > time()) {
+            $post_date = current_time('mysql');
+        }
 
         $post_data = [
             'post_title' => $title,
             'post_content' => $content,
             'post_status' => $this->settings['default_post_status'] ?? 'draft',
             'post_author' => $this->settings['default_author'] ?? 1,
-            'post_date' => $item->get_date('Y-m-d H:i:s'),
+            'post_date' => $post_date,
             'post_type' => 'post',
         ];
 
@@ -466,6 +482,17 @@ class Substack_Sync_Processor
      */
     private function process_post_images(int $post_id, string $content): void
     {
+        if (trim($content) === '') {
+            return;
+        }
+
+        // media_sideload_image() and its helpers live in wp-admin/includes and
+        // are NOT autoloaded on the cron (wp-cron.php) or admin-ajax paths, so
+        // the call would be an undefined-function fatal without these requires.
+        require_once ABSPATH . 'wp-admin/includes/media.php';
+        require_once ABSPATH . 'wp-admin/includes/file.php';
+        require_once ABSPATH . 'wp-admin/includes/image.php';
+
         $doc = new DOMDocument();
         @$doc->loadHTML($content, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
 
@@ -474,15 +501,89 @@ class Substack_Sync_Processor
 
         foreach ($images as $img) {
             $src = $img->getAttribute('src');
-            if (! empty($src) && filter_var($src, FILTER_VALIDATE_URL)) {
-                $attachment_id = media_sideload_image($src, $post_id, '', 'id');
+            if (empty($src) || ! filter_var($src, FILTER_VALIDATE_URL)) {
+                continue;
+            }
 
-                if (! is_wp_error($attachment_id) && ! $first_image_set) {
-                    set_post_thumbnail($post_id, $attachment_id);
-                    $first_image_set = true;
+            // Feed content is attacker-influenced. filter_var only checks URL
+            // syntax, so an <img src="http://169.254.169.254/..."> or an
+            // RFC1918/loopback target would otherwise be fetched server-side
+            // (SSRF). Only sideload images from public http(s) hosts.
+            if (! $this->is_safe_remote_url($src)) {
+                error_log('Substack Sync: skipped unsafe image URL - ' . $src);
+
+                continue;
+            }
+
+            $attachment_id = media_sideload_image($src, $post_id, '', 'id');
+
+            if (! is_wp_error($attachment_id) && ! $first_image_set) {
+                set_post_thumbnail($post_id, $attachment_id);
+                $first_image_set = true;
+            }
+        }
+    }
+
+    /**
+     * Whether a URL is safe to fetch server-side.
+     *
+     * Requires an http(s) scheme, no embedded credentials, and a host that
+     * resolves only to public IP addresses (no private, reserved, loopback, or
+     * link-local ranges). Best-effort SSRF guard for untrusted feed content;
+     * it cannot defeat DNS-rebinding, but blocks the direct internal-target
+     * and cloud-metadata cases.
+     *
+     * @param string $url The candidate image URL.
+     * @return bool True when the URL is safe to sideload.
+     */
+    private function is_safe_remote_url(string $url): bool
+    {
+        $parts = wp_parse_url($url);
+
+        if (empty($parts['host'])) {
+            return false;
+        }
+        if (empty($parts['scheme']) || ! in_array(strtolower($parts['scheme']), ['http', 'https'], true)) {
+            return false;
+        }
+        if (isset($parts['user']) || isset($parts['pass'])) {
+            return false;
+        }
+
+        $host = $parts['host'];
+        $ips = [];
+
+        if (filter_var($host, FILTER_VALIDATE_IP)) {
+            $ips[] = $host;
+        } else {
+            if (strtolower($host) === 'localhost' || substr(strtolower($host), -6) === '.local') {
+                return false;
+            }
+            $records = @dns_get_record($host, DNS_A | DNS_AAAA);
+            if (is_array($records)) {
+                foreach ($records as $record) {
+                    if (! empty($record['ip'])) {
+                        $ips[] = $record['ip'];
+                    } elseif (! empty($record['ipv6'])) {
+                        $ips[] = $record['ipv6'];
+                    }
                 }
             }
         }
+
+        // If we cannot resolve the host to any address, refuse rather than
+        // hand an unverifiable target to download_url().
+        if (empty($ips)) {
+            return false;
+        }
+
+        foreach ($ips as $ip) {
+            if (! filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /**
@@ -696,6 +797,13 @@ class Substack_Sync_Processor
      */
     public function rollback_posts_by_date(string $date_from, string $date_to): int
     {
+        // Require well-formed YYYY-MM-DD dates. Empty or malformed input would
+        // otherwise build nonsense " 00:00:00" BETWEEN bounds and delete an
+        // unintended set of posts.
+        if (! $this->is_valid_date($date_from) || ! $this->is_valid_date($date_to)) {
+            return 0;
+        }
+
         global $wpdb;
         $table_name = $wpdb->prefix . 'substack_sync_log';
 
@@ -728,6 +836,19 @@ class Substack_Sync_Processor
     }
 
     /**
+     * Validate a date string is a real calendar date in Y-m-d format.
+     *
+     * @param string $date The date string to validate.
+     * @return bool True when $date is a well-formed YYYY-MM-DD date.
+     */
+    private function is_valid_date(string $date): bool
+    {
+        $parsed = DateTime::createFromFormat('Y-m-d', $date);
+
+        return $parsed !== false && $parsed->format('Y-m-d') === $date;
+    }
+
+    /**
      * Apply category mapping based on keywords in post content.
      *
      * @param string $content The post content to analyze.
@@ -743,17 +864,24 @@ class Substack_Sync_Processor
         }
 
         foreach ($category_mappings as $mapping) {
-            if (empty($mapping['keyword']) || empty($mapping['category'])) {
+            if (! is_array($mapping)) {
                 continue;
             }
 
-            $keyword = strtolower(trim($mapping['keyword']));
+            // Use a strict emptiness check, matching the sanitizer, so a keyword
+            // of literally "0" is honored rather than silently dropped by
+            // empty('0') === true (which would store dead, never-matching config).
+            $keyword = is_scalar($mapping['keyword'] ?? null) ? strtolower(trim((string) $mapping['keyword'])) : '';
+            $category_id = absint($mapping['category'] ?? 0);
+            if ($keyword === '' || $category_id <= 0) {
+                continue;
+            }
+
             $content_lower = strtolower($content);
 
             // Check if keyword exists in content
             if (strpos($content_lower, $keyword) !== false) {
-                $category_id = intval($mapping['category']);
-                if ($category_id > 0 && ! in_array($category_id, $assigned_categories)) {
+                if (! in_array($category_id, $assigned_categories, true)) {
                     $assigned_categories[] = $category_id;
                 }
             }
