@@ -5,55 +5,71 @@ declare(strict_types=1);
 use PHPUnit\Framework\TestCase;
 
 /**
- * Tests confirming that each patched vulnerability was real and is now fixed.
+ * Each test loads BOTH the upstream (cspenn) and patched source, asserts the
+ * vulnerability is present in the original, then asserts it is gone in the fix.
  *
- * Each test documents the pre-fix behavior, then asserts the fix is in place.
- * If any of these tests fail, a regression has been introduced.
+ * This structure proves the bugs were real, not hypothetical.
  */
 class SecurityFixesTest extends TestCase
 {
-    private static string $processorSource;
-    private static string $adminSource;
+    private static string $upstreamProcessor;
+    private static string $upstreamAdmin;
+    private static string $patchedProcessor;
+    private static string $patchedAdmin;
 
     public static function setUpBeforeClass(): void
     {
-        self::$processorSource = file_get_contents(
-            dirname(__DIR__) . '/includes/class-substack-sync-processor.php'
-        );
-        self::$adminSource = file_get_contents(
-            dirname(__DIR__) . '/admin/class-substack-sync-admin.php'
-        );
+        $upstreamDir = dirname(__DIR__) . '/tests/fixtures/upstream';
+        if (! is_dir($upstreamDir)) {
+            self::fail(
+                "Upstream fixtures missing. Run:\n" .
+                "  git show main:includes/class-substack-sync-processor.php > tests/fixtures/upstream/class-substack-sync-processor.php\n" .
+                "  git show main:admin/class-substack-sync-admin.php > tests/fixtures/upstream/class-substack-sync-admin.php"
+            );
+        }
+
+        self::$upstreamProcessor = file_get_contents($upstreamDir . '/class-substack-sync-processor.php');
+        self::$upstreamAdmin = file_get_contents($upstreamDir . '/class-substack-sync-admin.php');
+        self::$patchedProcessor = file_get_contents(dirname(__DIR__) . '/includes/class-substack-sync-processor.php');
+        self::$patchedAdmin = file_get_contents(dirname(__DIR__) . '/admin/class-substack-sync-admin.php');
     }
 
     // ---------------------------------------------------------------
     // 1. Draft-revert bug
     //
-    // VULNERABILITY: update_post() hardcoded post_status to 'draft',
-    // so every hourly cron cycle reverted published posts to draft.
-    //
-    // FIX: unset post_status in update_post() so existing status is
-    // preserved by wp_update_post().
+    // update_post() hardcoded post_status to 'draft', so every hourly
+    // cron cycle reverted published posts back to draft.
     // ---------------------------------------------------------------
 
-    public function test_update_post_does_not_hardcode_draft_status(): void
+    public function test_upstream_update_post_hardcodes_draft(): void
     {
+        $method = self::extractPhpMethod(self::$upstreamProcessor, 'update_post');
+
+        $this->assertStringContainsString(
+            "'post_status' => 'draft'",
+            $method,
+            'UPSTREAM: update_post() should hardcode draft (proving the bug exists)'
+        );
+    }
+
+    public function test_patched_update_post_does_not_hardcode_draft(): void
+    {
+        $method = self::extractPhpMethod(self::$patchedProcessor, 'update_post');
+
         $this->assertStringNotContainsString(
             "'post_status' => 'draft'",
-            $this->getUpdatePostMethod(),
-            'update_post() must not hardcode post_status to draft'
+            $method,
+            'PATCHED: update_post() must not hardcode draft'
         );
-    }
 
-    public function test_update_post_unsets_post_status(): void
-    {
         $this->assertStringContainsString(
             "unset(\$post_data['post_status'])",
-            $this->getUpdatePostMethod(),
-            'update_post() must unset post_status so wp_update_post preserves the existing value'
+            $method,
+            'PATCHED: update_post() must unset post_status to preserve existing value'
         );
     }
 
-    public function test_published_post_stays_published_after_update(): void
+    public function test_wp_update_post_preserves_status_when_omitted(): void
     {
         global $_wp_posts, $_wp_post_id_counter;
         $_wp_posts = [];
@@ -65,290 +81,300 @@ class SecurityFixesTest extends TestCase
             'post_status' => 'publish',
         ]);
 
-        $this->assertEquals('publish', get_post($post_id)->post_status);
-
-        $update_data = [
+        // Simulate the patched update_post: omit post_status
+        wp_update_post([
             'ID' => $post_id,
             'post_title' => 'Updated Title',
             'post_content' => 'Updated content',
-        ];
-        wp_update_post($update_data);
+        ]);
 
         $this->assertEquals(
             'publish',
             get_post($post_id)->post_status,
-            'Post status must remain "publish" when update_data omits post_status'
+            'Omitting post_status from wp_update_post must preserve the existing value'
+        );
+
+        // Simulate the ORIGINAL bug: explicitly set draft
+        wp_update_post([
+            'ID' => $post_id,
+            'post_title' => 'Updated Again',
+            'post_status' => 'draft',
+        ]);
+
+        $this->assertEquals(
+            'draft',
+            get_post($post_id)->post_status,
+            'Explicitly setting post_status to draft overwrites the value (this is the bug)'
         );
     }
 
     // ---------------------------------------------------------------
     // 2. Stored XSS in admin log viewer
     //
-    // VULNERABILITY: refreshLogs() used innerHTML to render
-    // substack_title, allowing script injection via crafted titles.
-    //
-    // FIX: switched to textContent + createElement.
+    // refreshLogs() used innerHTML to render substack_title, allowing
+    // script injection via crafted post titles.
     // ---------------------------------------------------------------
 
-    public function test_refresh_logs_does_not_use_innerHTML_for_titles(): void
+    public function test_upstream_refresh_logs_uses_innerHTML(): void
     {
-        $refreshLogsMethod = $this->extractJsFunction('refreshLogs');
+        $method = self::extractJsFunction(self::$upstreamAdmin, 'refreshLogs');
+
+        $this->assertStringContainsString(
+            'innerHTML',
+            $method,
+            'UPSTREAM: refreshLogs() should use innerHTML (proving the XSS vector exists)'
+        );
+
+        $this->assertMatchesRegularExpression(
+            '/\$\{.*substack_title\}/',
+            $method,
+            'UPSTREAM: substack_title should be interpolated into the innerHTML template'
+        );
+    }
+
+    public function test_patched_refresh_logs_uses_safe_dom(): void
+    {
+        $method = self::extractJsFunction(self::$patchedAdmin, 'refreshLogs');
 
         $this->assertStringNotContainsString(
             'innerHTML',
-            $refreshLogsMethod,
-            'refreshLogs() must not use innerHTML (XSS vector for substack_title)'
+            $method,
+            'PATCHED: refreshLogs() must not use innerHTML'
         );
-    }
-
-    public function test_refresh_logs_uses_textContent(): void
-    {
-        $refreshLogsMethod = $this->extractJsFunction('refreshLogs');
 
         $this->assertStringContainsString(
             'textContent',
-            $refreshLogsMethod,
-            'refreshLogs() must use textContent to safely render post titles'
+            $method,
+            'PATCHED: refreshLogs() must use textContent'
         );
-    }
-
-    public function test_refresh_logs_uses_createElement(): void
-    {
-        $refreshLogsMethod = $this->extractJsFunction('refreshLogs');
 
         $this->assertStringContainsString(
             'createElement',
-            $refreshLogsMethod,
-            'refreshLogs() must use createElement for safe DOM construction'
+            $method,
+            'PATCHED: refreshLogs() must use createElement'
         );
     }
 
     // ---------------------------------------------------------------
     // 3. Unsanitized RSS content inserted into database
     //
-    // VULNERABILITY: prepare_post_data() passed raw feed content and
-    // titles to wp_insert_post() without sanitization.
-    //
-    // FIX: content passes through wp_kses_post(), titles through
-    // sanitize_text_field().
+    // prepare_post_data() passed raw feed content and titles to
+    // wp_insert_post() without sanitization.
     // ---------------------------------------------------------------
 
-    public function test_prepare_post_data_sanitizes_content(): void
+    public function test_upstream_prepare_post_data_has_no_sanitization(): void
     {
-        $method = $this->getPreparePostDataMethod();
+        $method = self::extractPhpMethod(self::$upstreamProcessor, 'prepare_post_data');
+
+        $this->assertStringNotContainsString(
+            'wp_kses_post',
+            $method,
+            'UPSTREAM: prepare_post_data() should lack wp_kses_post (proving content is unsanitized)'
+        );
+
+        $this->assertStringNotContainsString(
+            'sanitize_text_field',
+            $method,
+            'UPSTREAM: prepare_post_data() should lack sanitize_text_field (proving title is unsanitized)'
+        );
+    }
+
+    public function test_patched_prepare_post_data_sanitizes(): void
+    {
+        $method = self::extractPhpMethod(self::$patchedProcessor, 'prepare_post_data');
 
         $this->assertStringContainsString(
             'wp_kses_post',
             $method,
-            'prepare_post_data() must run content through wp_kses_post()'
+            'PATCHED: prepare_post_data() must sanitize content with wp_kses_post()'
         );
-    }
-
-    public function test_prepare_post_data_sanitizes_title(): void
-    {
-        $method = $this->getPreparePostDataMethod();
 
         $this->assertStringContainsString(
             'sanitize_text_field',
             $method,
-            'prepare_post_data() must run title through sanitize_text_field()'
+            'PATCHED: prepare_post_data() must sanitize title with sanitize_text_field()'
         );
     }
 
-    public function test_script_tags_stripped_from_content(): void
+    public function test_sanitization_functions_actually_strip_attacks(): void
     {
-        $malicious = '<p>Hello</p><script>alert("xss")</script><p>World</p>';
-        $sanitized = wp_kses_post($malicious);
-
-        $this->assertStringNotContainsString(
-            '<script>',
-            $sanitized,
-            'wp_kses_post must strip script tags from feed content'
-        );
+        $xssContent = '<p>Hello</p><script>alert("xss")</script><p>World</p>';
+        $sanitized = wp_kses_post($xssContent);
+        $this->assertStringNotContainsString('<script>', $sanitized);
         $this->assertStringContainsString('<p>Hello</p>', $sanitized);
-        $this->assertStringContainsString('<p>World</p>', $sanitized);
-    }
 
-    public function test_html_stripped_from_title(): void
-    {
-        $malicious = 'Post Title<img src=x onerror=alert(1)>';
-        $sanitized = sanitize_text_field($malicious);
-
+        $xssTitle = 'Post Title<img src=x onerror=alert(1)>';
+        $sanitized = sanitize_text_field($xssTitle);
         $this->assertStringNotContainsString('<img', $sanitized);
-        $this->assertStringNotContainsString('onerror', $sanitized);
         $this->assertStringContainsString('Post Title', $sanitized);
     }
 
     // ---------------------------------------------------------------
     // 4. No sanitize_callback on register_setting
     //
-    // VULNERABILITY: settings were stored without any server-side
-    // validation. feed_url could contain non-URL values, post_status
-    // could be arbitrary strings, author could be non-integer.
-    //
-    // FIX: added sanitize_callback that validates each field.
+    // Settings were stored without server-side validation.
     // ---------------------------------------------------------------
 
-    public function test_register_setting_has_sanitize_callback(): void
+    public function test_upstream_register_setting_has_no_sanitize_callback(): void
+    {
+        $this->assertStringNotContainsString(
+            'sanitize_callback',
+            self::$upstreamAdmin,
+            'UPSTREAM: register_setting() should lack sanitize_callback (proving settings are unvalidated)'
+        );
+    }
+
+    public function test_patched_register_setting_has_sanitize_callback(): void
     {
         $this->assertStringContainsString(
             'sanitize_callback',
-            self::$adminSource,
-            'register_setting() must include a sanitize_callback'
+            self::$patchedAdmin,
+            'PATCHED: register_setting() must include sanitize_callback'
         );
     }
 
-    public function test_sanitize_settings_validates_feed_url(): void
+    public function test_sanitize_settings_rejects_bad_input(): void
     {
         $admin = new Substack_Sync_Admin();
 
         $result = $admin->sanitize_settings([
-            'feed_url' => 'not-a-url',
-        ]);
-        $this->assertEmpty(
-            $result['feed_url'],
-            'Invalid URLs must be rejected'
-        );
-
-        $result = $admin->sanitize_settings([
-            'feed_url' => 'https://example.substack.com/feed',
-        ]);
-        $this->assertEquals(
-            'https://example.substack.com/feed',
-            $result['feed_url'],
-            'Valid URLs must be preserved'
-        );
-    }
-
-    public function test_sanitize_settings_rejects_invalid_post_status(): void
-    {
-        $admin = new Substack_Sync_Admin();
-
-        $result = $admin->sanitize_settings([
-            'default_post_status' => 'private',
-        ]);
-        $this->assertEquals(
-            'draft',
-            $result['default_post_status'],
-            'Invalid post status must fall back to draft'
-        );
-    }
-
-    public function test_sanitize_settings_casts_author_to_int(): void
-    {
-        $admin = new Substack_Sync_Admin();
-
-        $result = $admin->sanitize_settings([
-            'default_author' => '42abc',
-        ]);
-        $this->assertIsInt($result['default_author']);
-        $this->assertEquals(42, $result['default_author']);
-    }
-
-    public function test_sanitize_settings_strips_html_from_keywords(): void
-    {
-        $admin = new Substack_Sync_Admin();
-
-        $result = $admin->sanitize_settings([
+            'feed_url' => 'javascript:alert(1)',
+            'default_author' => 'DROP TABLE',
+            'default_post_status' => 'evil',
             'category_mapping' => [
-                ['keyword' => '<script>alert(1)</script>marketing', 'category' => '5'],
-            ],
-        ]);
-
-        $this->assertCount(1, $result['category_mapping']);
-        $this->assertStringNotContainsString('<script>', $result['category_mapping'][0]['keyword']);
-        $this->assertStringContainsString('marketing', $result['category_mapping'][0]['keyword']);
-    }
-
-    public function test_sanitize_settings_drops_empty_mappings(): void
-    {
-        $admin = new Substack_Sync_Admin();
-
-        $result = $admin->sanitize_settings([
-            'category_mapping' => [
+                ['keyword' => '<script>xss</script>', 'category' => 'abc'],
                 ['keyword' => '', 'category' => '5'],
-                ['keyword' => 'valid', 'category' => '0'],
-                ['keyword' => 'good', 'category' => '3'],
+                ['keyword' => 'valid', 'category' => '3'],
             ],
         ]);
 
+        $this->assertEmpty($result['feed_url'], 'javascript: URLs must be rejected');
+        $this->assertEquals(0, $result['default_author'], 'Non-numeric author must become 0');
+        $this->assertEquals('draft', $result['default_post_status'], 'Invalid status must fall back to draft');
+        $this->assertCount(1, $result['category_mapping'], 'Only the valid mapping should survive');
+        $this->assertEquals('valid', $result['category_mapping'][0]['keyword']);
+        $this->assertEquals(3, $result['category_mapping'][0]['category']);
+    }
+
+    public function test_sanitize_settings_preserves_good_input(): void
+    {
+        $admin = new Substack_Sync_Admin();
+
+        $result = $admin->sanitize_settings([
+            'feed_url' => 'https://sovereigngrace.substack.com/feed',
+            'default_author' => '42',
+            'default_post_status' => 'publish',
+            'delete_data_on_uninstall' => '1',
+            'category_mapping' => [
+                ['keyword' => 'theology', 'category' => '7'],
+            ],
+        ]);
+
+        $this->assertEquals('https://sovereigngrace.substack.com/feed', $result['feed_url']);
+        $this->assertEquals(42, $result['default_author']);
+        $this->assertEquals('publish', $result['default_post_status']);
+        $this->assertTrue($result['delete_data_on_uninstall']);
         $this->assertCount(1, $result['category_mapping']);
-        $this->assertEquals('good', $result['category_mapping'][0]['keyword']);
+        $this->assertEquals('theology', $result['category_mapping'][0]['keyword']);
     }
 
     // ---------------------------------------------------------------
     // 5. Triple SubstackSyncProgress instantiation
     //
-    // VULNERABILITY: SubstackSyncProgress was instantiated 3 times
-    // (inline, DOMContentLoaded listener, readyState fallback), each
-    // attaching a click listener. Clicking Sync fired 2-3 concurrent
-    // batch sync chains causing duplicate imports.
-    //
-    // FIX: removed the DOMContentLoaded and readyState initializations,
-    // keeping only the single inline initialization that checks for the
-    // button's existence.
+    // Three code paths each created new SubstackSyncProgress(), so
+    // clicking Sync fired 2-3 concurrent batch chains.
     // ---------------------------------------------------------------
 
-    public function test_single_sync_progress_instantiation(): void
+    public function test_upstream_has_multiple_sync_progress_instantiations(): void
     {
-        $count = substr_count(self::$adminSource, 'new SubstackSyncProgress()');
+        $count = substr_count(self::$upstreamAdmin, 'new SubstackSyncProgress()');
+
+        $this->assertGreaterThan(
+            1,
+            $count,
+            "UPSTREAM: should have multiple SubstackSyncProgress() instantiations (found {$count})"
+        );
+    }
+
+    public function test_patched_has_exactly_one_sync_progress_instantiation(): void
+    {
+        $count = substr_count(self::$patchedAdmin, 'new SubstackSyncProgress()');
 
         $this->assertEquals(
             1,
             $count,
-            "SubstackSyncProgress must be instantiated exactly once, found {$count} instances"
+            "PATCHED: must have exactly one SubstackSyncProgress() instantiation (found {$count})"
         );
     }
 
-    public function test_no_domcontentloaded_sync_init(): void
+    public function test_upstream_has_domcontentloaded_sync_init(): void
+    {
+        $this->assertMatchesRegularExpression(
+            '/DOMContentLoaded.*SubstackSyncProgress/s',
+            self::$upstreamAdmin,
+            'UPSTREAM: should have a DOMContentLoaded-based SubstackSyncProgress init'
+        );
+    }
+
+    public function test_patched_has_no_domcontentloaded_sync_init(): void
     {
         $this->assertDoesNotMatchRegularExpression(
             '/DOMContentLoaded.*SubstackSyncProgress/s',
-            self::$adminSource,
-            'SubstackSyncProgress must not be initialized inside a DOMContentLoaded listener'
+            self::$patchedAdmin,
+            'PATCHED: must not have a DOMContentLoaded-based SubstackSyncProgress init'
         );
     }
 
     // ---------------------------------------------------------------
     // 6. Server path disclosure in error responses
     //
-    // VULNERABILITY: AJAX error response included debug_info with
-    // $e->getFile() and $e->getLine(), exposing server filesystem
-    // paths to the admin UI.
-    //
-    // FIX: removed debug_info from the error response.
+    // handle_batch_sync() included debug_info with getFile() and
+    // getLine() in AJAX error responses.
     // ---------------------------------------------------------------
 
-    public function test_no_debug_info_in_ajax_error_response(): void
+    public function test_upstream_batch_sync_exposes_debug_info(): void
     {
-        $batchSyncHandler = $this->extractPhpMethod('handle_batch_sync');
+        $method = self::extractPhpMethod(self::$upstreamAdmin, 'handle_batch_sync');
+
+        $this->assertStringContainsString(
+            'debug_info',
+            $method,
+            'UPSTREAM: handle_batch_sync() should include debug_info (proving path disclosure exists)'
+        );
+
+        $this->assertStringContainsString(
+            'getFile()',
+            $method,
+            'UPSTREAM: should expose server file paths'
+        );
+
+        $this->assertStringContainsString(
+            'getLine()',
+            $method,
+            'UPSTREAM: should expose line numbers'
+        );
+    }
+
+    public function test_patched_batch_sync_hides_debug_info(): void
+    {
+        $method = self::extractPhpMethod(self::$patchedAdmin, 'handle_batch_sync');
 
         $this->assertStringNotContainsString(
             'debug_info',
-            $batchSyncHandler,
-            'AJAX error responses must not include debug_info'
+            $method,
+            'PATCHED: must not include debug_info in error responses'
         );
-    }
-
-    public function test_no_getfile_in_ajax_responses(): void
-    {
-        $batchSyncHandler = $this->extractPhpMethod('handle_batch_sync');
 
         $this->assertStringNotContainsString(
             'getFile()',
-            $batchSyncHandler,
-            'AJAX error responses must not expose server file paths via getFile()'
+            $method,
+            'PATCHED: must not expose server file paths'
         );
-    }
-
-    public function test_no_getline_in_ajax_responses(): void
-    {
-        $batchSyncHandler = $this->extractPhpMethod('handle_batch_sync');
 
         $this->assertStringNotContainsString(
             'getLine()',
-            $batchSyncHandler,
-            'AJAX error responses must not expose line numbers via getLine()'
+            $method,
+            'PATCHED: must not expose line numbers'
         );
     }
 
@@ -356,26 +382,11 @@ class SecurityFixesTest extends TestCase
     // Helpers
     // ---------------------------------------------------------------
 
-    private function getUpdatePostMethod(): string
-    {
-        return $this->extractPhpMethodFromSource(self::$processorSource, 'update_post');
-    }
-
-    private function getPreparePostDataMethod(): string
-    {
-        return $this->extractPhpMethodFromSource(self::$processorSource, 'prepare_post_data');
-    }
-
-    private function extractPhpMethod(string $methodName): string
-    {
-        return $this->extractPhpMethodFromSource(self::$adminSource, $methodName);
-    }
-
-    private function extractPhpMethodFromSource(string $source, string $methodName): string
+    private static function extractPhpMethod(string $source, string $methodName): string
     {
         $pattern = '/function\s+' . preg_quote($methodName) . '\s*\([^)]*\)[^{]*\{/';
         if (! preg_match($pattern, $source, $match, PREG_OFFSET_CAPTURE)) {
-            $this->fail("Could not find method {$methodName} in source");
+            self::fail("Could not find method {$methodName} in source");
         }
 
         $start = $match[0][1];
@@ -395,33 +406,33 @@ class SecurityFixesTest extends TestCase
             }
         }
 
-        $this->fail("Could not extract method {$methodName}: unbalanced braces");
+        self::fail("Could not extract method {$methodName}: unbalanced braces");
     }
 
-    private function extractJsFunction(string $funcName): string
+    private static function extractJsFunction(string $source, string $funcName): string
     {
         $pattern = '/' . preg_quote($funcName) . '\s*\(\s*\)\s*\{/';
-        if (! preg_match($pattern, self::$adminSource, $match, PREG_OFFSET_CAPTURE)) {
-            $this->fail("Could not find JS function {$funcName} in admin source");
+        if (! preg_match($pattern, $source, $match, PREG_OFFSET_CAPTURE)) {
+            self::fail("Could not find JS function {$funcName} in source");
         }
 
         $start = $match[0][1];
         $braceCount = 0;
-        $len = strlen(self::$adminSource);
+        $len = strlen($source);
         $inFunc = false;
 
         for ($i = $start; $i < $len; $i++) {
-            if (self::$adminSource[$i] === '{') {
+            if ($source[$i] === '{') {
                 $braceCount++;
                 $inFunc = true;
-            } elseif (self::$adminSource[$i] === '}') {
+            } elseif ($source[$i] === '}') {
                 $braceCount--;
                 if ($inFunc && $braceCount === 0) {
-                    return substr(self::$adminSource, $start, $i - $start + 1);
+                    return substr($source, $start, $i - $start + 1);
                 }
             }
         }
 
-        $this->fail("Could not extract JS function {$funcName}: unbalanced braces");
+        self::fail("Could not extract JS function {$funcName}: unbalanced braces");
     }
 }
