@@ -351,7 +351,7 @@ class Substack_Sync_Processor
     {
         $post_data = $this->prepare_post_data($item);
         $post_data['ID'] = $existing_post['post_id'];
-        $post_data['post_status'] = 'draft'; // Set to draft for review
+        unset($post_data['post_status']);
         $post_title = $post_data['post_title'];
         $guid = $item->get_id();
 
@@ -404,8 +404,8 @@ class Substack_Sync_Processor
      */
     private function prepare_post_data($item): array
     {
-        $content = $this->process_content($item->get_content());
-        $title = $item->get_title();
+        $content = wp_kses_post($this->process_content($item->get_content()));
+        $title = sanitize_text_field($item->get_title());
 
         // Apply category mapping based on content and title
         $full_text = $title . ' ' . $content;

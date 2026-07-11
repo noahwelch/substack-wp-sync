@@ -51,7 +51,9 @@ class Substack_Sync_Admin
      */
     public function register_settings(): void
     {
-        register_setting('substack_sync_settings_group', 'substack_sync_settings');
+        register_setting('substack_sync_settings_group', 'substack_sync_settings', [
+            'sanitize_callback' => [$this, 'sanitize_settings'],
+        ]);
 
         add_settings_section(
             'substack_sync_main',
@@ -99,6 +101,48 @@ class Substack_Sync_Admin
             'substack-sync',
             'substack_sync_main'
         );
+    }
+
+    /**
+     * Sanitize settings before saving.
+     *
+     * @param array<string, mixed> $input Raw settings input.
+     * @return array<string, mixed> Sanitized settings.
+     */
+    public function sanitize_settings(array $input): array
+    {
+        $sanitized = [];
+
+        $sanitized['feed_url'] = isset($input['feed_url'])
+            ? esc_url_raw($input['feed_url'])
+            : '';
+
+        $sanitized['default_author'] = isset($input['default_author'])
+            ? absint($input['default_author'])
+            : 1;
+
+        $allowed_statuses = ['draft', 'publish'];
+        $sanitized['default_post_status'] = isset($input['default_post_status']) && in_array($input['default_post_status'], $allowed_statuses, true)
+            ? $input['default_post_status']
+            : 'draft';
+
+        $sanitized['delete_data_on_uninstall'] = !empty($input['delete_data_on_uninstall']);
+
+        $sanitized['category_mapping'] = [];
+        if (!empty($input['category_mapping']) && is_array($input['category_mapping'])) {
+            foreach ($input['category_mapping'] as $mapping) {
+                $keyword = sanitize_text_field($mapping['keyword'] ?? '');
+                $category = absint($mapping['category'] ?? 0);
+                if ($keyword !== '' && $category > 0) {
+                    $sanitized['category_mapping'][] = [
+                        'keyword' => $keyword,
+                        'category' => $category,
+                    ];
+                }
+            }
+        }
+
+        return $sanitized;
     }
 
     /**
@@ -534,11 +578,14 @@ class Substack_Sync_Admin
                     .then(data => {
                         if (data.success && data.data.logs) {
                             const logContainer = document.getElementById('sync-activity-log');
-                            logContainer.innerHTML = data.data.logs.map(log => 
-                                `<div style="margin-bottom: 5px; color: ${this.getLogColor(log.status)};">
-                                    ${log.sync_date} - ${log.status.toUpperCase()}: ${log.substack_title}
-                                </div>`
-                            ).join('');
+                            logContainer.textContent = '';
+                            data.data.logs.forEach(log => {
+                                const entry = document.createElement('div');
+                                entry.style.marginBottom = '5px';
+                                entry.style.color = this.getLogColor(log.status);
+                                entry.textContent = `${log.sync_date} - ${log.status.toUpperCase()}: ${log.substack_title}`;
+                                logContainer.appendChild(entry);
+                            });
                         }
                     });
                 }
@@ -798,18 +845,6 @@ class Substack_Sync_Admin
                 }
             }
 
-            // Initialize when DOM is ready
-            document.addEventListener('DOMContentLoaded', function() {
-                new SubstackSyncProgress();
-            });
-
-            // Fallback for cases where DOMContentLoaded already fired
-            if (document.readyState === 'loading') {
-                // Do nothing, DOMContentLoaded will fire
-            } else {
-                // DOMContentLoaded already fired
-                new SubstackSyncProgress();
-            }
             </script>
         </div>
         <?php
@@ -876,10 +911,6 @@ class Substack_Sync_Admin
             wp_send_json_error([
                 'message' => 'Sync error: ' . $e->getMessage(),
                 'has_more' => false,
-                'debug_info' => [
-                    'file' => $e->getFile(),
-                    'line' => $e->getLine(),
-                ],
             ]);
         }
     }
