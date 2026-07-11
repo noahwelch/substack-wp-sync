@@ -11,6 +11,9 @@ declare(strict_types=1);
  * NO SUPPORT PROVIDED. USE AT YOUR OWN RISK.
  */
 
+// If this file is called directly, abort.
+defined('ABSPATH') || exit;
+
 /**
  * Fired during plugin deactivation.
  *

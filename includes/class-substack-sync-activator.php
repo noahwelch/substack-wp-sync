@@ -11,6 +11,9 @@ declare(strict_types=1);
  * NO SUPPORT PROVIDED. USE AT YOUR OWN RISK.
  */
 
+// If this file is called directly, abort.
+defined('ABSPATH') || exit;
+
 /**
  * Fired during plugin activation.
  *
@@ -21,10 +24,25 @@ class Substack_Sync_Activator
     /**
      * Activate the plugin.
      *
-     * Creates the database table for tracking synchronized posts.
+     * Creates the database table for tracking synchronized posts. On a network
+     * activation, the table is created for every existing site; otherwise only
+     * for the current site.
+     *
+     * @param bool $network_wide Whether the plugin is being network-activated.
      */
-    public static function activate(): void
+    public static function activate(bool $network_wide = false): void
     {
+        if (is_multisite() && $network_wide) {
+            $site_ids = get_sites(['fields' => 'ids', 'number' => 0]);
+            foreach ($site_ids as $site_id) {
+                switch_to_blog((int) $site_id);
+                self::create_sync_table();
+                restore_current_blog();
+            }
+
+            return;
+        }
+
         self::create_sync_table();
     }
 

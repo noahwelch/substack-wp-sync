@@ -11,9 +11,6 @@ declare(strict_types=1);
  * NO SUPPORT PROVIDED. USE AT YOUR OWN RISK.
  */
 
-// If this file is called directly, abort.
-defined('ABSPATH') || exit;
-
 /**
  * The admin-specific functionality of the plugin.
  *
@@ -54,9 +51,7 @@ class Substack_Sync_Admin
      */
     public function register_settings(): void
     {
-        register_setting('substack_sync_settings_group', 'substack_sync_settings', [
-            'sanitize_callback' => [$this, 'sanitize_settings'],
-        ]);
+        register_setting('substack_sync_settings_group', 'substack_sync_settings');
 
         add_settings_section(
             'substack_sync_main',
@@ -104,69 +99,6 @@ class Substack_Sync_Admin
             'substack-sync',
             'substack_sync_main'
         );
-    }
-
-    /**
-     * Sanitize settings before saving.
-     *
-     * Registered as the sanitize_callback on register_setting(), so this fires
-     * on every add_option/update_option for the option, not just the settings
-     * form. WordPress can hand it a non-array value (e.g. options.php passes
-     * null when the option key is absent from $_POST), so the parameter is left
-     * untyped and coerced here rather than relying on a strict array hint that
-     * would fatal under declare(strict_types=1).
-     *
-     * @param mixed $input Raw settings input (array from the form, but not guaranteed).
-     * @return array<string, mixed> Sanitized settings.
-     */
-    public function sanitize_settings($input): array
-    {
-        if (! is_array($input)) {
-            $input = [];
-        }
-
-        $sanitized = [];
-
-        $sanitized['feed_url'] = isset($input['feed_url']) && is_string($input['feed_url'])
-            ? esc_url_raw($input['feed_url'])
-            : '';
-
-        // wp_dropdown_users() emits value="-1" for its "none" option. Treat any
-        // non-positive or non-scalar selection as the default author (1) rather
-        // than letting absint() silently flip -1 into user ID 1.
-        $author = isset($input['default_author']) && is_scalar($input['default_author'])
-            ? (int) $input['default_author']
-            : 1;
-        $sanitized['default_author'] = $author > 0 ? $author : 1;
-
-        $allowed_statuses = ['draft', 'publish'];
-        $sanitized['default_post_status'] = isset($input['default_post_status']) && in_array($input['default_post_status'], $allowed_statuses, true)
-            ? $input['default_post_status']
-            : 'draft';
-
-        $sanitized['delete_data_on_uninstall'] = !empty($input['delete_data_on_uninstall']);
-
-        $sanitized['category_mapping'] = [];
-        if (!empty($input['category_mapping']) && is_array($input['category_mapping'])) {
-            foreach ($input['category_mapping'] as $mapping) {
-                if (! is_array($mapping)) {
-                    continue;
-                }
-                $keyword = is_scalar($mapping['keyword'] ?? null) ? sanitize_text_field((string) $mapping['keyword']) : '';
-                // Use (int) + a sign check, not absint(): absint() would strip
-                // the sign and turn a negative category ID into a valid positive
-                // one (the same footgun guarded against for default_author above).
-                $category = is_scalar($mapping['category'] ?? null) ? (int) $mapping['category'] : 0;
-                if ($keyword !== '' && $category > 0) {
-                    $sanitized['category_mapping'][] = [
-                        'keyword' => $keyword,
-                        'category' => $category,
-                    ];
-                }
-            }
-        }
-
-        return $sanitized;
     }
 
     /**
@@ -602,14 +534,11 @@ class Substack_Sync_Admin
                     .then(data => {
                         if (data.success && data.data.logs) {
                             const logContainer = document.getElementById('sync-activity-log');
-                            logContainer.textContent = '';
-                            data.data.logs.forEach(log => {
-                                const entry = document.createElement('div');
-                                entry.style.marginBottom = '5px';
-                                entry.style.color = this.getLogColor(log.status);
-                                entry.textContent = `${log.sync_date} - ${log.status.toUpperCase()}: ${log.substack_title}`;
-                                logContainer.appendChild(entry);
-                            });
+                            logContainer.innerHTML = data.data.logs.map(log => 
+                                `<div style="margin-bottom: 5px; color: ${this.getLogColor(log.status)};">
+                                    ${log.sync_date} - ${log.status.toUpperCase()}: ${log.substack_title}
+                                </div>`
+                            ).join('');
                         }
                     });
                 }
@@ -625,17 +554,7 @@ class Substack_Sync_Admin
                         warning: '#ffb900'
                     };
                     
-                    // Build the node instead of assigning innerHTML: `message` may
-                    // carry server payloads derived from feed content, so it must
-                    // reach the DOM as text, never as parsed HTML.
-                    element.textContent = '';
-                    const box = document.createElement('div');
-                    box.style.padding = '10px';
-                    box.style.borderLeft = `4px solid ${colors[type] || '#0073aa'}`;
-                    box.style.background = '#f9f9f9';
-                    box.style.margin = '10px 0';
-                    box.textContent = message;
-                    element.appendChild(box);
+                    element.innerHTML = `<div style="padding: 10px; border-left: 4px solid ${colors[type] || '#0073aa'}; background: #f9f9f9; margin: 10px 0;">${message}</div>`;
                 }
 
                 getLogColor(status) {
@@ -879,6 +798,18 @@ class Substack_Sync_Admin
                 }
             }
 
+            // Initialize when DOM is ready
+            document.addEventListener('DOMContentLoaded', function() {
+                new SubstackSyncProgress();
+            });
+
+            // Fallback for cases where DOMContentLoaded already fired
+            if (document.readyState === 'loading') {
+                // Do nothing, DOMContentLoaded will fire
+            } else {
+                // DOMContentLoaded already fired
+                new SubstackSyncProgress();
+            }
             </script>
         </div>
         <?php
@@ -905,13 +836,8 @@ class Substack_Sync_Admin
             } else {
                 wp_send_json_error($result['error']);
             }
-        } catch (Throwable $e) {
-            // Catch Throwable, not just Exception: a TypeError/Error here would
-            // otherwise escape as an uncaught fatal. Log the raw message (which
-            // for Error/TypeError embeds the absolute server path) and return a
-            // generic one so the path is never disclosed in the response.
-            error_log('Substack Sync Sync Error: ' . $e->getMessage());
-            wp_send_json_error(['message' => 'Sync failed. Check the server error log for details.']);
+        } catch (Exception $e) {
+            wp_send_json_error($e->getMessage());
         }
     }
 
@@ -946,13 +872,14 @@ class Substack_Sync_Admin
             // Ensure clean JSON response
             wp_send_json_success($result);
         } catch (Throwable $e) {
-            // Log the raw message but return a generic one: an Error/TypeError
-            // message embeds the absolute server path, re-leaking exactly what
-            // stripping the debug fields from this response set out to close.
             error_log('Substack Sync AJAX Error: ' . $e->getMessage());
             wp_send_json_error([
-                'message' => 'Sync error. Check the server error log for details.',
+                'message' => 'Sync error: ' . $e->getMessage(),
                 'has_more' => false,
+                'debug_info' => [
+                    'file' => $e->getFile(),
+                    'line' => $e->getLine(),
+                ],
             ]);
         }
     }
@@ -1000,7 +927,7 @@ class Substack_Sync_Admin
             ]);
         } catch (Throwable $e) {
             error_log('Substack Sync Retry Error: ' . $e->getMessage());
-            wp_send_json_error(['message' => 'Retry error. Check the server error log for details.']);
+            wp_send_json_error(['message' => 'Retry error: ' . $e->getMessage()]);
         }
     }
 
@@ -1058,7 +985,7 @@ class Substack_Sync_Admin
             ]);
         } catch (Throwable $e) {
             error_log('Substack Sync Rollback Error: ' . $e->getMessage());
-            wp_send_json_error(['message' => 'Rollback error. Check the server error log for details.']);
+            wp_send_json_error(['message' => 'Rollback error: ' . $e->getMessage()]);
         }
     }
 
@@ -1091,7 +1018,7 @@ class Substack_Sync_Admin
             ]);
         } catch (Throwable $e) {
             error_log('Substack Sync Stats Error: ' . $e->getMessage());
-            wp_send_json_error(['message' => 'Stats error. Check the server error log for details.']);
+            wp_send_json_error(['message' => 'Stats error: ' . $e->getMessage()]);
         }
     }
 }

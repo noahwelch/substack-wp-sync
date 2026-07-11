@@ -11,6 +11,9 @@ declare(strict_types=1);
  * NO SUPPORT PROVIDED. USE AT YOUR OWN RISK.
  */
 
+// If this file is called directly, abort.
+defined('ABSPATH') || exit;
+
 /**
  * The cron-specific functionality of the plugin.
  *
@@ -41,7 +44,15 @@ class Substack_Sync_Cron
     {
         // Ensure the processor class is available
         require_once SUBSTACK_SYNC_PLUGIN_DIR . 'includes/class-substack-sync-processor.php';
-        $processor = new Substack_Sync_Processor();
-        $processor->run_sync();
+
+        // Guard the whole dispatch: an uncaught Error/Throwable here would
+        // terminate the wp-cron.php request and take any other hooks batched
+        // into the same run down with it.
+        try {
+            $processor = new Substack_Sync_Processor();
+            $processor->run_sync();
+        } catch (Throwable $e) {
+            error_log('Substack Sync: hourly sync failed - ' . $e->getMessage());
+        }
     }
 }
