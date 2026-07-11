@@ -680,11 +680,7 @@ class Substack_Sync_Processor
      */
     private function process_post_images(int $post_id, string $content): void
     {
-        // Sideloaded images only serve as the featured image, so once one is
-        // set there is nothing left to do. Without this guard, every hourly
-        // update re-downloaded every image into the media library, duplicating
-        // attachments unboundedly over time.
-        if (trim($content) === '' || has_post_thumbnail($post_id)) {
+        if (trim($content) === '' || stripos($content, '<img') === false) {
             return;
         }
 
@@ -696,45 +692,123 @@ class Substack_Sync_Processor
         require_once ABSPATH . 'wp-admin/includes/image.php';
 
         $doc = new DOMDocument();
-        @$doc->loadHTML($content, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
+        $loaded = @$doc->loadHTML(
+            '<?xml encoding="utf-8"?><div>' . $content . '</div>',
+            LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD
+        );
+        $wrapper = $doc->documentElement;
 
-        $images = $doc->getElementsByTagName('img');
-        $attempts = 0;
+        if (! $loaded || ! $wrapper instanceof DOMElement) {
+            return;
+        }
 
-        foreach ($images as $img) {
-            // Each sideload is a synchronous remote HTTP fetch inside the sync
-            // request. A max_execution_time kill mid-loop is not a Throwable,
-            // so no catch block can save the run; bound the work instead.
-            if ($attempts >= 5) {
-                error_log('Substack Sync: giving up on featured image for post ' . $post_id . ' after 5 attempts');
+        $home_host = strtolower((string) wp_parse_url(home_url(), PHP_URL_HOST));
+        $failed_downloads = 0;
+        $new_downloads = 0;
+        $rewritten = 0;
+        $first_attachment = 0;
 
-                return;
-            }
-
+        foreach ($doc->getElementsByTagName('img') as $img) {
             $src = $img->getAttribute('src');
             if (empty($src) || ! filter_var($src, FILTER_VALIDATE_URL)) {
                 continue;
             }
 
-            // Feed content is attacker-influenced. filter_var only checks URL
-            // syntax, so an <img src="http://169.254.169.254/..."> or an
-            // RFC1918/loopback target would otherwise be fetched server-side
-            // (SSRF). Only sideload images from public http(s) hosts.
-            if (! $this->is_safe_remote_url($src)) {
-                error_log('Substack Sync: skipped unsafe image URL - ' . $src);
-
+            // Already served locally (rewritten on an earlier sync): skip.
+            $src_host = strtolower((string) wp_parse_url($src, PHP_URL_HOST));
+            if ($src_host !== '' && $src_host === $home_host) {
                 continue;
             }
 
-            $attempts++;
-            $attachment_id = media_sideload_image($src, $post_id, '', 'id');
+            // One download per source URL, ever: syncs run hourly, and without
+            // this the same image would re-enter the media library every run.
+            $attachment_id = $this->find_attachment_by_source($src);
 
-            if (! is_wp_error($attachment_id)) {
-                set_post_thumbnail($post_id, $attachment_id);
+            if (! $attachment_id) {
+                // Each sideload is a synchronous remote HTTP fetch inside the
+                // sync request. A max_execution_time kill mid-loop is not a
+                // Throwable, so no catch block can save the run; bound the
+                // per-run work in both directions. Skipped images are retried
+                // on later runs, so localization converges incrementally.
+                if ($failed_downloads >= 5 || $new_downloads >= 10) {
+                    continue;
+                }
 
-                return;
+                // Feed content is attacker-influenced. filter_var only checks
+                // URL syntax, so an <img src="http://169.254.169.254/..."> or
+                // an RFC1918/loopback target would otherwise be fetched
+                // server-side (SSRF). Only sideload from public http(s) hosts.
+                if (! $this->is_safe_remote_url($src)) {
+                    error_log('Substack Sync: skipped unsafe image URL - ' . $src);
+
+                    continue;
+                }
+
+                $new_downloads++;
+                $result = media_sideload_image($src, $post_id, '', 'id');
+
+                if (is_wp_error($result)) {
+                    $failed_downloads++;
+                    error_log('Substack Sync: image sideload failed - ' . $result->get_error_message());
+
+                    continue;
+                }
+
+                $attachment_id = (int) $result;
+                update_post_meta($attachment_id, '_substack_sync_source_url', $src);
+            }
+
+            // Serve the local copy: without this rewrite the sideloaded files
+            // were never referenced, and posts kept hotlinking Substack's CDN.
+            $local_url = wp_get_attachment_url($attachment_id);
+            if ($local_url) {
+                $img->setAttribute('src', $local_url);
+                // A leftover remote srcset would make browsers ignore the
+                // localized src.
+                $img->removeAttribute('srcset');
+                $img->removeAttribute('sizes');
+                $rewritten++;
+            }
+
+            if (! $first_attachment) {
+                $first_attachment = $attachment_id;
             }
         }
+
+        if ($first_attachment && ! has_post_thumbnail($post_id)) {
+            set_post_thumbnail($post_id, $first_attachment);
+        }
+
+        if ($rewritten > 0) {
+            $html = '';
+            foreach ($wrapper->childNodes as $child) {
+                $html .= $doc->saveHTML($child);
+            }
+
+            wp_update_post([
+                'ID' => $post_id,
+                'post_content' => $html,
+            ]);
+        }
+    }
+
+    /**
+     * Find a previously sideloaded attachment by its original source URL.
+     *
+     * @param string $src The remote image URL.
+     * @return int The attachment ID, or 0 when none exists.
+     */
+    private function find_attachment_by_source(string $src): int
+    {
+        global $wpdb;
+
+        return (int) $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = %s AND meta_value = %s LIMIT 1",
+                '_substack_sync_source_url',
+                $src
+            )
+        );
     }
 
     /**

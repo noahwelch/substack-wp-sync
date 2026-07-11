@@ -263,6 +263,7 @@ if (! class_exists('wpdb')) {
     class wpdb
     {
         public string $prefix = 'wp_';
+        public string $postmeta = 'wp_postmeta';
         private array $rows = [];
 
         public function prepare(string $query, ...$args): string
@@ -277,6 +278,18 @@ if (! class_exists('wpdb')) {
 
         public function get_var(string $query)
         {
+            // Support the attachment source-url dedup lookup: resolve it
+            // against the in-memory post-meta store so tests can exercise
+            // "sideload once, reuse forever".
+            if (str_contains($query, '_substack_sync_source_url') && preg_match("/meta_value = '([^']+)'/", $query, $m)) {
+                global $_wp_post_meta;
+                foreach ((array) ($_wp_post_meta ?? []) as $post_id => $meta) {
+                    if (($meta['_substack_sync_source_url'] ?? null) === $m[1]) {
+                        return (string) $post_id;
+                    }
+                }
+            }
+
             return null;
         }
 
@@ -312,7 +325,9 @@ if (! class_exists('wpdb')) {
     }
 }
 
-$wpdb = new wpdb();
+// Assign via $GLOBALS: PHPUnit includes this bootstrap inside a function, so
+// a bare `$wpdb = ...` here would be local and `global $wpdb` would be null.
+$GLOBALS['wpdb'] = new wpdb();
 
 // --- WordPress hooks/admin stubs ---
 
@@ -490,6 +505,20 @@ if (! function_exists('media_sideload_image')) {
         }
 
         return $_wp_post_id_counter++;
+    }
+}
+
+if (! function_exists('home_url')) {
+    function home_url(string $path = ''): string
+    {
+        return 'https://myblog.example.com' . $path;
+    }
+}
+
+if (! function_exists('wp_get_attachment_url')) {
+    function wp_get_attachment_url(int $attachment_id)
+    {
+        return 'https://myblog.example.com/wp-content/uploads/' . $attachment_id . '.png';
     }
 }
 

@@ -28,9 +28,11 @@ class ReviewFixesTest extends TestCase
     {
         global $_wp_options, $_wp_transients, $_wp_deleted_transients, $_wp_added_filters,
             $_wp_removed_filters, $_wp_sideload_calls, $_wp_sideload_fail, $_wp_thumbnails,
-            $_wp_post_id_counter;
+            $_wp_post_id_counter, $_wp_posts, $_wp_post_meta;
 
         $_wp_post_id_counter = 1000;
+        $_wp_posts = [];
+        $_wp_post_meta = [];
         $_wp_options = [];
         $_wp_transients = [];
         $_wp_deleted_transients = [];
@@ -236,47 +238,110 @@ class ReviewFixesTest extends TestCase
     }
 
     // ---------------------------------------------------------------
-    // Bounded image sideloading: every hourly update used to re-download
-    // every image, and a hostile feed could force unbounded fetches.
+    // Image localization: sideload each image once (deduped by source
+    // URL), rewrite content to serve the local copies, set the featured
+    // image. Previously every hourly update re-downloaded every image
+    // into the media library and the copies were never referenced.
     // ---------------------------------------------------------------
 
-    public function test_process_post_images_stops_after_first_success(): void
+    public function test_images_are_localized_and_content_rewritten(): void
     {
         global $_wp_sideload_calls, $_wp_thumbnails;
 
-        $content = '<p><img src="http://8.8.8.8/a.png"><img src="http://8.8.4.4/b.png"><img src="http://1.1.1.1/c.png"></p>';
+        $post_id = wp_insert_post([
+            'post_title' => 'Image post',
+            'post_content' => 'placeholder',
+            'post_status' => 'publish',
+        ]);
 
-        $this->invokeProcessPostImages(501, $content);
+        $content = '<p><img src="http://8.8.8.8/a.png" srcset="http://8.8.8.8/a-2x.png 2x"><img src="http://8.8.4.4/b.png"></p>';
 
-        $this->assertCount(1, $_wp_sideload_calls, 'Sideloading must stop at the first successful featured image');
-        $this->assertArrayHasKey(501, $_wp_thumbnails, 'The successful sideload must become the featured image');
+        $this->invokeProcessPostImages($post_id, $content);
+
+        $this->assertCount(2, $_wp_sideload_calls, 'Every remote image must be sideloaded');
+
+        $saved = get_post($post_id)->post_content;
+        $this->assertStringNotContainsString('http://8.8.8.8/a.png', $saved, 'Content must be rewritten to the local copy');
+        $this->assertStringNotContainsString('srcset', $saved, 'Remote srcset must be dropped or it overrides the localized src');
+        $this->assertSame(2, substr_count($saved, 'myblog.example.com/wp-content/uploads/'), 'Both images must serve locally');
+        $this->assertArrayHasKey($post_id, $_wp_thumbnails, 'First localized image must become the featured image');
     }
 
-    public function test_process_post_images_skips_when_thumbnail_exists(): void
+    public function test_image_sideloads_are_deduped_across_runs(): void
     {
         global $_wp_sideload_calls;
 
-        set_post_thumbnail(502, 999);
+        $post_id = wp_insert_post(['post_title' => 'x', 'post_content' => 'p', 'post_status' => 'publish']);
+        $content = '<p><img src="http://8.8.8.8/a.png"></p>';
 
-        $this->invokeProcessPostImages(502, '<p><img src="http://8.8.8.8/a.png"></p>');
+        $this->invokeProcessPostImages($post_id, $content);
+        $first_run_calls = count($_wp_sideload_calls);
 
-        $this->assertCount(0, $_wp_sideload_calls, 'Updates of a post with a featured image must not re-download anything');
+        // Hourly update: prepare_post_data() regenerates content from the feed
+        // (remote URLs again), so the same source URL comes back through.
+        $this->invokeProcessPostImages($post_id, $content);
+
+        $this->assertSame(1, $first_run_calls);
+        $this->assertCount(1, $_wp_sideload_calls, 'A source URL already in the media library must never be downloaded again');
+
+        $saved = get_post($post_id)->post_content;
+        $this->assertStringContainsString('myblog.example.com/wp-content/uploads/', $saved, 'The rerun must still rewrite content to the existing local copy');
     }
 
-    public function test_process_post_images_bounds_failed_attempts(): void
+    public function test_process_post_images_skips_already_local_images(): void
+    {
+        global $_wp_sideload_calls;
+
+        $post_id = wp_insert_post(['post_title' => 'x', 'post_content' => 'p', 'post_status' => 'publish']);
+
+        $this->invokeProcessPostImages($post_id, '<p><img src="https://myblog.example.com/wp-content/uploads/42.png"></p>');
+
+        $this->assertCount(0, $_wp_sideload_calls, 'Images already served from this site must not be re-fetched');
+    }
+
+    public function test_process_post_images_bounds_failed_downloads(): void
     {
         global $_wp_sideload_calls, $_wp_sideload_fail;
 
         $_wp_sideload_fail = true;
+        $post_id = wp_insert_post(['post_title' => 'x', 'post_content' => 'p', 'post_status' => 'publish']);
 
         $imgs = '';
         for ($i = 1; $i <= 9; $i++) {
             $imgs .= sprintf('<img src="http://8.8.8.%d/x.png">', $i);
         }
 
-        $this->invokeProcessPostImages(503, "<p>{$imgs}</p>");
+        $this->invokeProcessPostImages($post_id, "<p>{$imgs}</p>");
 
         $this->assertCount(5, $_wp_sideload_calls, 'A feed full of failing image URLs must not trigger unbounded remote fetches');
+    }
+
+    public function test_process_post_images_bounds_new_downloads_per_run(): void
+    {
+        global $_wp_sideload_calls;
+
+        $post_id = wp_insert_post(['post_title' => 'x', 'post_content' => 'p', 'post_status' => 'publish']);
+
+        $imgs = '';
+        for ($i = 1; $i <= 14; $i++) {
+            $imgs .= sprintf('<img src="http://8.8.8.%d/x.png">', $i);
+        }
+
+        $this->invokeProcessPostImages($post_id, "<p>{$imgs}</p>");
+
+        $this->assertCount(10, $_wp_sideload_calls, 'New downloads are capped per run; the rest converge on later syncs');
+    }
+
+    public function test_process_post_images_preserves_existing_thumbnail(): void
+    {
+        global $_wp_thumbnails;
+
+        $post_id = wp_insert_post(['post_title' => 'x', 'post_content' => 'p', 'post_status' => 'publish']);
+        set_post_thumbnail($post_id, 999);
+
+        $this->invokeProcessPostImages($post_id, '<p><img src="http://8.8.8.8/a.png"></p>');
+
+        $this->assertSame(999, $_wp_thumbnails[$post_id], 'An existing featured image must not be overwritten');
     }
 
     // ---------------------------------------------------------------
