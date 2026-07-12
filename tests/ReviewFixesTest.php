@@ -29,8 +29,10 @@ class ReviewFixesTest extends TestCase
         global $_wp_options, $_wp_transients, $_wp_deleted_transients, $_wp_added_filters,
             $_wp_removed_filters, $_wp_sideload_calls, $_wp_sideload_fail, $_wp_thumbnails,
             $_wp_post_id_counter, $_wp_posts, $_wp_post_meta, $_wp_site_transients,
-            $_wp_deleted_site_transients, $_wp_json_responses, $_wp_missing_attachments;
+            $_wp_deleted_site_transients, $_wp_json_responses, $_wp_missing_attachments,
+            $_wp_get_results_rows;
 
+        $_wp_get_results_rows = [];
         $_wp_post_id_counter = 1000;
         $_wp_posts = [];
         $_wp_post_meta = [];
@@ -455,6 +457,123 @@ class ReviewFixesTest extends TestCase
                 "{$call} must run only inside a DOMContentLoaded handler, never at script-parse time"
             );
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Substack source-URL post meta: imported/updated posts must record
+    // their canonical Substack URL as public post meta so a front-end
+    // template (e.g. an Elementor Loop Grid) can link back to the original.
+    // ---------------------------------------------------------------
+
+    public function test_import_records_substack_source_url_meta(): void
+    {
+        global $_wp_post_meta;
+
+        $item = new SimplePie_Item('Hello', 'body', 'guid-hello', 'https://example.substack.com/p/hello');
+
+        $processor = new Substack_Sync_Processor();
+        $method = new ReflectionMethod($processor, 'import_post');
+        $result = $method->invoke($processor, $item, true);
+
+        $this->assertTrue($result['success']);
+        $this->assertSame(
+            'https://example.substack.com/p/hello',
+            $_wp_post_meta[$result['post_id']]['substack_source_url'] ?? null,
+            'A freshly imported post must record its Substack URL as substack_source_url meta'
+        );
+    }
+
+    public function test_update_records_substack_source_url_meta(): void
+    {
+        global $_wp_post_meta;
+
+        $post_id = wp_insert_post(['post_title' => 'x', 'post_content' => 'p', 'post_status' => 'publish']);
+        $item = new SimplePie_Item('Hello', 'body', 'guid-hello', 'https://example.substack.com/p/updated');
+
+        $processor = new Substack_Sync_Processor();
+        $method = new ReflectionMethod($processor, 'update_post');
+        $result = $method->invoke($processor, $item, ['post_id' => $post_id], true);
+
+        $this->assertTrue($result['success']);
+        $this->assertSame(
+            'https://example.substack.com/p/updated',
+            $_wp_post_meta[$post_id]['substack_source_url'] ?? null,
+            'An updated post must (back)fill its Substack URL meta on every sync'
+        );
+    }
+
+    public function test_empty_permalink_does_not_clobber_stored_source_url(): void
+    {
+        global $_wp_post_meta;
+
+        $post_id = wp_insert_post(['post_title' => 'x', 'post_content' => 'p', 'post_status' => 'publish']);
+        $_wp_post_meta[$post_id] = ['substack_source_url' => 'https://example.substack.com/p/kept'];
+
+        // A link-less feed item (get_permalink() === '') must not overwrite the
+        // previously-recorded URL with an empty string.
+        $item = new SimplePie_Item('Hello', 'body', 'guid-hello', ' ');
+
+        $processor = new Substack_Sync_Processor();
+        $method = new ReflectionMethod($processor, 'store_source_url');
+        $method->invoke($processor, $post_id, $item);
+
+        $this->assertSame(
+            'https://example.substack.com/p/kept',
+            $_wp_post_meta[$post_id]['substack_source_url']
+        );
+    }
+
+    public function test_backfill_mirrors_log_table_guid_into_source_url_meta(): void
+    {
+        global $_wp_get_results_rows, $_wp_post_meta;
+
+        $_wp_post_meta[502] = ['substack_source_url' => 'https://example.substack.com/p/already'];
+        $_wp_get_results_rows = [
+            'SELECT post_id, substack_guid' => [
+                ['post_id' => 501, 'substack_guid' => 'https://example.substack.com/p/a'],
+                ['post_id' => 502, 'substack_guid' => 'https://example.substack.com/p/b'],
+                ['post_id' => 503, 'substack_guid' => 'not-a-url-guid'],
+                ['post_id' => 504, 'substack_guid' => 'https://example.substack.com/p/d'],
+            ],
+        ];
+
+        $processor = new Substack_Sync_Processor();
+        $count = $processor->backfill_source_urls();
+
+        $this->assertSame(2, $count, 'Only the two URL-guid posts missing meta should be backfilled');
+        $this->assertSame('https://example.substack.com/p/a', $_wp_post_meta[501]['substack_source_url']);
+        $this->assertSame('https://example.substack.com/p/d', $_wp_post_meta[504]['substack_source_url']);
+        $this->assertSame(
+            'https://example.substack.com/p/already',
+            $_wp_post_meta[502]['substack_source_url'],
+            'A post that already has the meta must not be overwritten'
+        );
+        $this->assertArrayNotHasKey(
+            503,
+            $_wp_post_meta,
+            'A non-URL guid must be skipped, not stored as a bogus link'
+        );
+        $this->assertTrue((bool) get_option('substack_sync_source_url_backfilled'), 'Backfill must set its done flag');
+
+        // Idempotent: a second run is a no-op once the flag is set.
+        $this->assertSame(0, $processor->backfill_source_urls());
+    }
+
+    public function test_backfill_is_a_noop_when_already_flagged(): void
+    {
+        global $_wp_get_results_rows, $_wp_post_meta;
+
+        update_option('substack_sync_source_url_backfilled', true);
+        $_wp_get_results_rows = [
+            'SELECT post_id, substack_guid' => [
+                ['post_id' => 601, 'substack_guid' => 'https://example.substack.com/p/x'],
+            ],
+        ];
+
+        $count = (new Substack_Sync_Processor())->backfill_source_urls();
+
+        $this->assertSame(0, $count);
+        $this->assertArrayNotHasKey(601, $_wp_post_meta, 'A flagged backfill must not touch post meta');
     }
 
     public function test_retry_reset_is_a_single_update_query(): void

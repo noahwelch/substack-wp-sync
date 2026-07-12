@@ -22,6 +22,17 @@ defined('ABSPATH') || exit;
 class Substack_Sync_Processor
 {
     /**
+     * Public post-meta key holding a post's canonical Substack URL. Non-underscore
+     * so it appears in Elementor's dynamic Custom Field picker.
+     */
+    private const SOURCE_URL_META_KEY = 'substack_source_url';
+
+    /**
+     * Option flag marking the one-time source-URL backfill as complete.
+     */
+    private const SOURCE_URL_BACKFILL_OPTION = 'substack_sync_source_url_backfilled';
+
+    /**
      * Plugin settings.
      *
      * @var array<string, mixed>
@@ -461,6 +472,7 @@ class Substack_Sync_Processor
 
         if ($post_id && ! is_wp_error($post_id)) {
             $this->log_sync($post_id, $guid, 'imported', $post_title);
+            $this->store_source_url((int) $post_id, $item);
 
             // Imports need the post to exist before images can be sideloaded
             // (attachment parent + featured image), so this is the one path that
@@ -538,6 +550,7 @@ class Substack_Sync_Processor
 
         if ($post_id && ! is_wp_error($post_id)) {
             $this->log_sync($post_id, $guid, 'updated', $post_title);
+            $this->store_source_url((int) $post_id, $item);
 
             if ($return_status) {
                 return [
@@ -982,6 +995,79 @@ class Substack_Sync_Processor
         }
 
         return true;
+    }
+
+    /**
+     * Record the canonical Substack URL for an imported/updated post as public
+     * post meta, so front-end templates (e.g. an Elementor Loop Grid with a
+     * dynamic Custom Field tag) can link each post back to its Substack
+     * original. The key is intentionally non-underscore/public so it shows up
+     * directly in Elementor's dynamic-field picker.
+     *
+     * SimplePie's get_permalink() is the feed item's <link> (the Substack post
+     * URL). Skip empty values so a feed item with no link never clobbers a
+     * previously-stored URL with ''.
+     *
+     * @param int $post_id The WordPress post ID.
+     * @param SimplePie_Item $item The feed item being imported/updated.
+     */
+    private function store_source_url(int $post_id, $item): void
+    {
+        $url = trim((string) $item->get_permalink());
+        if ($url !== '') {
+            update_post_meta($post_id, self::SOURCE_URL_META_KEY, esc_url_raw($url));
+        }
+    }
+
+    /**
+     * One-time backfill of the Substack source-URL meta for posts imported
+     * before store_source_url() existed. The sync-log table already holds the
+     * Substack GUID (which, for Substack feeds, is the post URL) keyed to
+     * post_id, so we mirror it into post meta without refetching the feed.
+     * Older posts that have aged out of the RSS window would otherwise never
+     * get the meta, since only feed-present posts pass back through
+     * update_post().
+     *
+     * Idempotent and gated by an option flag: safe to call on every admin load;
+     * does real work only once. Guards each GUID with a URL check so a
+     * non-URL GUID (not expected from Substack, but cheap to defend) is skipped
+     * rather than stored as a bogus link.
+     *
+     * @return int Number of posts backfilled.
+     */
+    public function backfill_source_urls(): int
+    {
+        if (get_option(self::SOURCE_URL_BACKFILL_OPTION)) {
+            return 0;
+        }
+
+        global $wpdb;
+        $table_name = $wpdb->prefix . 'substack_sync_log';
+
+        $rows = $wpdb->get_results(
+            "SELECT post_id, substack_guid FROM $table_name WHERE post_id > 0",
+            ARRAY_A
+        );
+
+        $backfilled = 0;
+        foreach ((array) $rows as $row) {
+            $post_id = (int) ($row['post_id'] ?? 0);
+            $guid = trim((string) ($row['substack_guid'] ?? ''));
+
+            if ($post_id <= 0 || filter_var($guid, FILTER_VALIDATE_URL) === false) {
+                continue;
+            }
+            if ((string) get_post_meta($post_id, self::SOURCE_URL_META_KEY, true) !== '') {
+                continue;
+            }
+
+            update_post_meta($post_id, self::SOURCE_URL_META_KEY, esc_url_raw($guid));
+            $backfilled++;
+        }
+
+        update_option(self::SOURCE_URL_BACKFILL_OPTION, true);
+
+        return $backfilled;
     }
 
     /**
