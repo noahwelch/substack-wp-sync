@@ -330,12 +330,21 @@ class Substack_Sync_Processor
     }
 
     /**
-     * Fetch the configured feed with an hourly (not core's 12-hour) cache.
+     * Fetch the configured feed with an hourly (not core's 12-hour) freshness.
      *
-     * Core's fetch_feed() caches for 12 hours by default, which would quietly
-     * defeat the hourly cron and the admin's "Sync Now" button. Shorten the
-     * lifetime for this feed only, and on manual syncs delete the transients
-     * SimplePie's WP cache uses so the fetch is genuinely fresh.
+     * Core defaults SimplePie's cache_duration to 12 hours, which would quietly
+     * defeat the hourly cron and the admin's "Sync Now" button. The
+     * wp_feed_cache_transient_lifetime filter fires from two core call sites
+     * with different second arguments: feed.php passes the raw URL and feeds the
+     * value into SimplePie::set_cache_duration() (the freshness gate we care
+     * about, and the closure below matches there), while WP_Feed_Cache_Transient
+     * passes the md5 cache-key name (the closure does not match there, so the
+     * stored transient's own garbage-collection TTL is left at core's default).
+     * Shortening the freshness gate is what makes the hourly refresh work.
+     *
+     * On a manual sync we also delete the cached feed outright. Core stores it
+     * via *_site_transient() as of WP 6.9 and via plain *_transient() before
+     * that, so clear both key spaces to cover the supported 6.0+ range.
      *
      * @param bool $force_refresh Whether to bypass any existing cached copy.
      * @return SimplePie|WP_Error The feed, or an error.
@@ -346,9 +355,12 @@ class Substack_Sync_Processor
 
         if ($force_refresh) {
             // WP_Feed_Cache_Transient key names; best-effort invalidation that
-            // degrades to a <=1h stale feed if core ever renames them.
-            delete_transient('feed_' . md5($url));
-            delete_transient('feed_mod_' . md5($url));
+            // degrades to a <=1h stale feed if core ever renames them. Clear
+            // both the plain (<6.9) and site (>=6.9) transient stores.
+            foreach (['feed_' . md5($url), 'feed_mod_' . md5($url)] as $key) {
+                delete_transient($key);
+                delete_site_transient($key);
+            }
         }
 
         $lifetime = static function ($seconds, $feed_url) use ($url) {
@@ -449,7 +461,14 @@ class Substack_Sync_Processor
 
         if ($post_id && ! is_wp_error($post_id)) {
             $this->log_sync($post_id, $guid, 'imported', $post_title);
-            $this->process_post_images($post_id, $post_data['post_content']);
+
+            // Imports need the post to exist before images can be sideloaded
+            // (attachment parent + featured image), so this is the one path that
+            // writes twice: insert, then a single update with localized content.
+            $localized = $this->process_post_images($post_id, $post_data['post_content']);
+            if ($localized !== null) {
+                wp_update_post(['ID' => $post_id, 'post_content' => $localized]);
+            }
 
             if ($return_status) {
                 return [
@@ -502,11 +521,19 @@ class Substack_Sync_Processor
             return;
         }
 
+        // Localize images before the single write: the post already exists, so
+        // its ID is available for sideloading, and writing already-localized
+        // content means an unchanged hourly sync matches what is stored, so
+        // WordPress skips the revision and post_modified bump entirely.
+        $localized = $this->process_post_images((int) $post_data['ID'], $post_data['post_content']);
+        if ($localized !== null) {
+            $post_data['post_content'] = $localized;
+        }
+
         $post_id = wp_update_post($post_data);
 
         if ($post_id && ! is_wp_error($post_id)) {
             $this->log_sync($post_id, $guid, 'updated', $post_title);
-            $this->process_post_images($post_id, $post_data['post_content']);
 
             if ($return_status) {
                 return [
@@ -645,7 +672,12 @@ class Substack_Sync_Processor
         $div->setAttribute('class', 'substack-subscribe-block');
 
         $link = $doc->createElement('a', 'Subscribe to our newsletter');
-        $link->setAttribute('href', esc_url($this->settings['feed_url'] ?? ''));
+        // esc_url_raw, not esc_url: display-context esc_url() rewrites & to the
+        // literal text &#038;, which saveHTML() then re-escapes to &amp;#038;,
+        // corrupting any feed URL with 2+ query params. setAttribute stores the
+        // value verbatim and saveHTML() does the correct attribute escaping, so
+        // the non-display escaper is the right one for a DOM attribute.
+        $link->setAttribute('href', esc_url_raw($this->settings['feed_url'] ?? ''));
         $link->setAttribute('target', '_blank');
         $div->appendChild($link);
 
@@ -673,15 +705,24 @@ class Substack_Sync_Processor
     }
 
     /**
-     * Process and import images from post content.
+     * Sideload remote images and return content rewritten to the local copies.
+     *
+     * Sideloads (deduped by source URL) and sets the featured image as side
+     * effects, but does NOT write the post: it returns the localized HTML so the
+     * caller folds it into a single wp_update_post(). Localizing before the
+     * caller's only write means an unchanged hourly sync produces content
+     * identical to what is stored, so WordPress creates no revision and does not
+     * bump post_modified. Writing here separately (as an earlier version did)
+     * doubled revisions on every image post, every hour, forever.
      *
      * @param int $post_id The WordPress post ID.
      * @param string $content The post content.
+     * @return string|null The localized content, or null when nothing was rewritten.
      */
-    private function process_post_images(int $post_id, string $content): void
+    private function process_post_images(int $post_id, string $content): ?string
     {
         if (trim($content) === '' || stripos($content, '<img') === false) {
-            return;
+            return null;
         }
 
         // media_sideload_image() and its helpers live in wp-admin/includes and
@@ -699,7 +740,7 @@ class Substack_Sync_Processor
         $wrapper = $doc->documentElement;
 
         if (! $loaded || ! $wrapper instanceof DOMElement) {
-            return;
+            return null;
         }
 
         $home_host = strtolower((string) wp_parse_url(home_url(), PHP_URL_HOST));
@@ -785,11 +826,10 @@ class Substack_Sync_Processor
                 $html .= $doc->saveHTML($child);
             }
 
-            wp_update_post([
-                'ID' => $post_id,
-                'post_content' => $html,
-            ]);
+            return $html;
         }
+
+        return null;
     }
 
     /**

@@ -434,12 +434,22 @@ if (! function_exists('wp_json_encode')) {
     function wp_json_encode($data, int $options = 0): string { return json_encode($data, $options); }
 }
 
+$_wp_json_responses = [];
+
 if (! function_exists('wp_send_json_success')) {
-    function wp_send_json_success($data = null): void {}
+    function wp_send_json_success($data = null): void
+    {
+        global $_wp_json_responses;
+        $_wp_json_responses[] = ['type' => 'success', 'data' => $data];
+    }
 }
 
 if (! function_exists('wp_send_json_error')) {
-    function wp_send_json_error($data = null): void {}
+    function wp_send_json_error($data = null): void
+    {
+        global $_wp_json_responses;
+        $_wp_json_responses[] = ['type' => 'error', 'data' => $data];
+    }
 }
 
 if (! function_exists('wp_die')) {
@@ -476,6 +486,41 @@ if (! function_exists('delete_transient')) {
         global $_wp_transients, $_wp_deleted_transients;
         $_wp_deleted_transients[] = $transient;
         unset($_wp_transients[$transient]);
+
+        return true;
+    }
+}
+
+// Site transients: a distinct key space from plain transients. WP_Feed_Cache_Transient
+// stores the cached feed here as of WP 6.9, so the manual cache-bust must clear it.
+$_wp_site_transients = [];
+$_wp_deleted_site_transients = [];
+
+if (! function_exists('get_site_transient')) {
+    function get_site_transient(string $transient)
+    {
+        global $_wp_site_transients;
+
+        return $_wp_site_transients[$transient] ?? false;
+    }
+}
+
+if (! function_exists('set_site_transient')) {
+    function set_site_transient(string $transient, $value, int $expiration = 0): bool
+    {
+        global $_wp_site_transients;
+        $_wp_site_transients[$transient] = $value;
+
+        return true;
+    }
+}
+
+if (! function_exists('delete_site_transient')) {
+    function delete_site_transient(string $transient): bool
+    {
+        global $_wp_site_transients, $_wp_deleted_site_transients;
+        $_wp_deleted_site_transients[] = $transient;
+        unset($_wp_site_transients[$transient]);
 
         return true;
     }

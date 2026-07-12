@@ -28,7 +28,8 @@ class ReviewFixesTest extends TestCase
     {
         global $_wp_options, $_wp_transients, $_wp_deleted_transients, $_wp_added_filters,
             $_wp_removed_filters, $_wp_sideload_calls, $_wp_sideload_fail, $_wp_thumbnails,
-            $_wp_post_id_counter, $_wp_posts, $_wp_post_meta;
+            $_wp_post_id_counter, $_wp_posts, $_wp_post_meta, $_wp_site_transients,
+            $_wp_deleted_site_transients, $_wp_json_responses;
 
         $_wp_post_id_counter = 1000;
         $_wp_posts = [];
@@ -36,11 +37,15 @@ class ReviewFixesTest extends TestCase
         $_wp_options = [];
         $_wp_transients = [];
         $_wp_deleted_transients = [];
+        $_wp_site_transients = [];
+        $_wp_deleted_site_transients = [];
+        $_wp_json_responses = [];
         $_wp_added_filters = [];
         $_wp_removed_filters = [];
         $_wp_sideload_calls = [];
         $_wp_sideload_fail = false;
         $_wp_thumbnails = [];
+        $_POST = [];
     }
 
     // ---------------------------------------------------------------
@@ -426,6 +431,96 @@ class ReviewFixesTest extends TestCase
     }
 
     // ---------------------------------------------------------------
+    // Follow-up review fixes
+    // ---------------------------------------------------------------
+
+    // Batch sync (the only handler wired to a UI button) wrapped
+    // run_batch_sync()'s own failure payload in wp_send_json_success(), so a
+    // lock-held/no-feed/fetch-error run surfaced to the browser as a clean
+    // 0-post "completed" instead of the error.
+    public function test_batch_sync_reports_error_when_lock_held(): void
+    {
+        global $_wp_json_responses;
+
+        update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
+        set_transient('substack_sync_running', time(), 300);
+        $_POST['_ajax_nonce'] = 'test-nonce';
+        $_POST['offset'] = '0';
+        $_POST['batch_size'] = '1';
+
+        (new Substack_Sync_Admin())->handle_batch_sync();
+
+        $this->assertNotEmpty($_wp_json_responses, 'The handler must send a JSON response');
+        $this->assertSame(
+            'error',
+            $_wp_json_responses[0]['type'],
+            'A lock-held batch sync must send wp_send_json_error, not a success envelope wrapping success:false'
+        );
+        $this->assertStringContainsString('already running', (string) $_wp_json_responses[0]['data']);
+    }
+
+    // esc_url() (display context) rewrites & to the literal text &#038;, which
+    // DOMDocument::saveHTML() then re-escapes to &amp;#038;, corrupting any feed
+    // URL with 2+ query params. esc_url_raw() is the correct escaper for a value
+    // set via setAttribute(). Source-level assertion: the stubs cannot reproduce
+    // core esc_url()'s entity substitution, so testing the value would be hollow.
+    public function test_subscribe_link_uses_non_display_url_escaper(): void
+    {
+        $method = $this->extractPhpMethod(self::$processorSource, 'build_subscribe_node');
+
+        $this->assertStringContainsString(
+            'esc_url_raw(',
+            $method,
+            'Subscribe href must use esc_url_raw(): display esc_url() emits &#038;, which saveHTML re-escapes into the URL'
+        );
+        $this->assertStringNotContainsString(
+            'esc_url($',
+            $method,
+            'Display-context esc_url() must not be used for a DOM attribute value'
+        );
+    }
+
+    // WP 6.9+ stores the cached feed via *_site_transient(), a distinct key
+    // space from plain transients. The forced-refresh cache-bust must clear it
+    // there too or "Sync Now" silently serves stale content on WP 6.9/7.0.
+    public function test_manual_sync_busts_site_transient_cache(): void
+    {
+        global $_wp_deleted_site_transients;
+
+        $url = 'https://example.substack.com/feed';
+        update_option('substack_sync_settings', ['feed_url' => $url]);
+
+        (new Substack_Sync_Processor())->run_sync(true, true);
+
+        $this->assertContains('feed_' . md5($url), $_wp_deleted_site_transients, 'Forced refresh must delete the site-transient feed cache (WP 6.9+)');
+        $this->assertContains('feed_mod_' . md5($url), $_wp_deleted_site_transients, 'Forced refresh must delete the site-transient feed_mod cache (WP 6.9+)');
+    }
+
+    // process_post_images() must localize and RETURN content, not write the post
+    // itself: the caller folds the result into its single write, so an unchanged
+    // hourly sync no longer double-writes (two revisions + modified bump/post/run).
+    public function test_process_post_images_returns_content_without_writing(): void
+    {
+        $post_id = wp_insert_post([
+            'post_title' => 'x',
+            'post_content' => 'ORIGINAL',
+            'post_status' => 'publish',
+        ]);
+
+        $processor = new Substack_Sync_Processor();
+        $method = new ReflectionMethod($processor, 'process_post_images');
+        $localized = $method->invoke($processor, $post_id, '<p><img src="http://8.8.8.8/a.png"></p>');
+
+        $this->assertSame(
+            'ORIGINAL',
+            get_post($post_id)->post_content,
+            'process_post_images() must not write the post; the caller performs the single write'
+        );
+        $this->assertNotNull($localized, 'It must return the localized content when an image was rewritten');
+        $this->assertStringContainsString('myblog.example.com/wp-content/uploads/', $localized);
+    }
+
+    // ---------------------------------------------------------------
     // Helpers
     // ---------------------------------------------------------------
 
@@ -437,11 +532,19 @@ class ReviewFixesTest extends TestCase
         return $method->invoke($processor, $content);
     }
 
-    private function invokeProcessPostImages(int $post_id, string $content): void
+    private function invokeProcessPostImages(int $post_id, string $content): ?string
     {
         $processor = new Substack_Sync_Processor();
         $method = new ReflectionMethod($processor, 'process_post_images');
-        $method->invoke($processor, $post_id, $content);
+        $localized = $method->invoke($processor, $post_id, $content);
+
+        // Mirror the production callers: process_post_images() localizes and
+        // returns the content; the caller performs the single write.
+        if ($localized !== null) {
+            wp_update_post(['ID' => $post_id, 'post_content' => $localized]);
+        }
+
+        return $localized;
     }
 
     private function invokeIsSafeRemoteUrl(string $url): bool

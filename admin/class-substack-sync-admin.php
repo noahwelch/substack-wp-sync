@@ -976,7 +976,18 @@ class Substack_Sync_Admin
             $offset = max(0, intval($_POST['offset'] ?? 0));
             $batch_size = max(1, intval($_POST['batch_size'] ?? 1));
 
-            wp_send_json_success($processor->run_batch_sync($batch_size, $offset));
+            $result = $processor->run_batch_sync($batch_size, $offset);
+
+            // run_batch_sync() reports its own failures (lock held, missing feed
+            // URL, fetch error) inside the payload. Wrapping those in
+            // wp_send_json_success() makes the browser's data.success check pass
+            // on a failed run, so the admin sees a clean 0-post "completed"
+            // instead of the error. Branch on the inner flag like handle_sync_now.
+            if ($result['success']) {
+                wp_send_json_success($result);
+            } else {
+                wp_send_json_error($result['error']);
+            }
         });
     }
 
