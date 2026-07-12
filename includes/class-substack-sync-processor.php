@@ -1005,17 +1005,18 @@ class Substack_Sync_Processor
      * directly in Elementor's dynamic-field picker.
      *
      * SimplePie's get_permalink() is the feed item's <link> (the Substack post
-     * URL). Skip empty values so a feed item with no link never clobbers a
-     * previously-stored URL with ''.
+     * URL). Sanitize first, then skip empty results so neither a link-less feed
+     * item nor one whose link esc_url_raw() rejects (bad scheme, malformed)
+     * ever clobbers a previously-stored URL with ''.
      *
      * @param int $post_id The WordPress post ID.
      * @param SimplePie_Item $item The feed item being imported/updated.
      */
     private function store_source_url(int $post_id, $item): void
     {
-        $url = trim((string) $item->get_permalink());
+        $url = esc_url_raw(trim((string) $item->get_permalink()));
         if ($url !== '') {
-            update_post_meta($post_id, self::SOURCE_URL_META_KEY, esc_url_raw($url));
+            update_post_meta($post_id, self::SOURCE_URL_META_KEY, $url);
         }
     }
 
@@ -1027,6 +1028,12 @@ class Substack_Sync_Processor
      * Older posts that have aged out of the RSS window would otherwise never
      * get the meta, since only feed-present posts pass back through
      * update_post().
+     *
+     * Note the source differs from the live path: this mirrors the stored guid
+     * (SimplePie get_id()), while store_source_url() writes get_permalink().
+     * They are the same value for Substack feeds, but the backfilled URL is not
+     * re-verified against get_permalink(). A post still present in the feed
+     * self-corrects on its next sync; an aged-out post keeps the guid value.
      *
      * Idempotent and gated by an option flag: safe to call on every admin load;
      * does real work only once. Guards each GUID with a URL check so a
@@ -1049,8 +1056,16 @@ class Substack_Sync_Processor
             ARRAY_A
         );
 
+        // $wpdb->get_results() returns null on a query error (vs. an empty array
+        // when there is genuinely nothing to backfill). Bail without setting the
+        // done flag so a transient DB failure doesn't permanently skip the
+        // backfill: admin_init retries it on the next load.
+        if ($rows === null) {
+            return 0;
+        }
+
         $backfilled = 0;
-        foreach ((array) $rows as $row) {
+        foreach ($rows as $row) {
             $post_id = (int) ($row['post_id'] ?? 0);
             $guid = trim((string) ($row['substack_guid'] ?? ''));
 
@@ -1061,7 +1076,12 @@ class Substack_Sync_Processor
                 continue;
             }
 
-            update_post_meta($post_id, self::SOURCE_URL_META_KEY, esc_url_raw($guid));
+            $url = esc_url_raw($guid);
+            if ($url === '') {
+                continue;
+            }
+
+            update_post_meta($post_id, self::SOURCE_URL_META_KEY, $url);
             $backfilled++;
         }
 

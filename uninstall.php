@@ -27,8 +27,9 @@ function substack_sync_uninstall_current_site(): void
         return;
     }
 
-    // Delete plugin settings
+    // Delete plugin settings and the one-time backfill flag
     delete_option('substack_sync_settings');
+    delete_option('substack_sync_source_url_backfilled');
 
     // Drop the custom database table (identifier is prefix-derived, not user input)
     global $wpdb;

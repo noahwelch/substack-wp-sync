@@ -576,6 +576,57 @@ class ReviewFixesTest extends TestCase
         $this->assertArrayNotHasKey(601, $_wp_post_meta, 'A flagged backfill must not touch post meta');
     }
 
+    public function test_malformed_permalink_does_not_clobber_stored_source_url(): void
+    {
+        global $_wp_post_meta;
+
+        $post_id = wp_insert_post(['post_title' => 'x', 'post_content' => 'p', 'post_status' => 'publish']);
+        $_wp_post_meta[$post_id] = ['substack_source_url' => 'https://example.substack.com/p/kept'];
+
+        // A non-empty link that esc_url_raw() rejects (reduces to '') must not
+        // overwrite the previously-recorded URL: the empty guard runs on the
+        // sanitized value, not the raw one.
+        $item = new SimplePie_Item('Hello', 'body', 'guid-hello', 'not a real url');
+
+        $processor = new Substack_Sync_Processor();
+        $method = new ReflectionMethod($processor, 'store_source_url');
+        $method->invoke($processor, $post_id, $item);
+
+        $this->assertSame(
+            'https://example.substack.com/p/kept',
+            $_wp_post_meta[$post_id]['substack_source_url']
+        );
+    }
+
+    public function test_backfill_does_not_flag_done_when_query_fails(): void
+    {
+        global $_wp_get_results_rows, $_wp_post_meta;
+
+        // Simulate a DB error: $wpdb->get_results() returns null, not [].
+        $_wp_get_results_rows = ['SELECT post_id, substack_guid' => null];
+
+        $processor = new Substack_Sync_Processor();
+
+        $this->assertSame(0, $processor->backfill_source_urls());
+        $this->assertFalse(
+            (bool) get_option('substack_sync_source_url_backfilled'),
+            'A failed query must not permanently mark the backfill done'
+        );
+
+        // Once the DB recovers, the same processor actually backfills.
+        $_wp_get_results_rows = [
+            'SELECT post_id, substack_guid' => [
+                ['post_id' => 701, 'substack_guid' => 'https://example.substack.com/p/recovered'],
+            ],
+        ];
+
+        $this->assertSame(1, $processor->backfill_source_urls());
+        $this->assertSame(
+            'https://example.substack.com/p/recovered',
+            $_wp_post_meta[701]['substack_source_url']
+        );
+    }
+
     public function test_retry_reset_is_a_single_update_query(): void
     {
         $method = $this->extractPhpMethod(self::$processorSource, 'reset_failed_posts');
