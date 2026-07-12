@@ -6,7 +6,7 @@ declare(strict_types=1);
  * Plugin Name:       Substack Sync
  * Plugin URI:        https://www.christopherspenn.com/2025/08/substack-sync-for-wordpress/
  * Description:       A fork of Christopher S. Penn's Substack Sync, with additional bug fixes and hardening. Syncs a Substack RSS feed to your WordPress site. NO SUPPORT PROVIDED. Use at your own risk. If it lights your computer on fire, it's not the author's fault.
- * Version:           1.1.0
+ * Version:           1.1.1
  * Author:            Christopher S. Penn
  * Author URI:        https://www.christopherspenn.com/
  * Fork Maintainer:   Noah Welch
@@ -25,7 +25,7 @@ if (! defined('WPINC')) {
 }
 
 // Define Plugin Constants
-define('SUBSTACK_SYNC_VERSION', '1.1.0');
+define('SUBSTACK_SYNC_VERSION', '1.1.1');
 define('SUBSTACK_SYNC_PLUGIN_DIR', plugin_dir_path(__FILE__));
 
 /**

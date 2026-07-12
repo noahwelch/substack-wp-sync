@@ -6,7 +6,7 @@ This is a fork of the original [Substack Sync](https://www.christopherspenn.com/
 
 - **Original author:** Christopher S. Penn (https://www.christopherspenn.com/)
 - **Fork maintainer:** Noah Welch
-- **Version:** 1.1.0
+- **Version:** 1.1.1
 - **License:** Apache-2.0
 
 ## Description
