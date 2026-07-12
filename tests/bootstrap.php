@@ -560,9 +560,19 @@ if (! function_exists('home_url')) {
     }
 }
 
+$_wp_missing_attachments = [];
+
 if (! function_exists('wp_get_attachment_url')) {
     function wp_get_attachment_url(int $attachment_id)
     {
+        global $_wp_missing_attachments;
+
+        // Simulate an attachment that was deleted outside the plugin: its meta
+        // row still resolves in the dedup lookup, but the URL no longer does.
+        if (in_array($attachment_id, $_wp_missing_attachments, true)) {
+            return false;
+        }
+
         return 'https://myblog.example.com/wp-content/uploads/' . $attachment_id . '.png';
     }
 }

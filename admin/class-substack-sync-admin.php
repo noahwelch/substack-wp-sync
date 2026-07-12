@@ -252,15 +252,26 @@ class Substack_Sync_Admin
         }
 
         foreach ($mappings as $index => $mapping) {
+            if (! is_array($mapping)) {
+                continue;
+            }
+
+            // esc_attr()/htmlspecialchars() throws a TypeError on an array
+            // argument, and stale or hand-edited option data can hold a
+            // non-scalar keyword/category. Coerce exactly like the processor's
+            // apply_category_mapping() does, so the settings page can't fatal.
+            $keyword = is_scalar($mapping['keyword'] ?? null) ? (string) $mapping['keyword'] : '';
+            $mapping_category = is_scalar($mapping['category'] ?? null) ? $mapping['category'] : '';
+
             echo '<div class="category-mapping-row" style="margin-bottom: 10px; padding: 10px; border: 1px solid #ddd; border-radius: 4px;">';
             echo '<label>Keyword: </label>';
-            echo '<input type="text" name="substack_sync_settings[category_mapping][' . $index . '][keyword]" value="' . esc_attr($mapping['keyword'] ?? '') . '" placeholder="e.g., marketing, tutorial" style="width: 200px; margin-right: 10px;" />';
+            echo '<input type="text" name="substack_sync_settings[category_mapping][' . $index . '][keyword]" value="' . esc_attr($keyword) . '" placeholder="e.g., marketing, tutorial" style="width: 200px; margin-right: 10px;" />';
             echo '<label>Category: </label>';
             echo '<select name="substack_sync_settings[category_mapping][' . $index . '][category]" style="width: 200px; margin-right: 10px;">';
             echo '<option value="">Select Category</option>';
 
             foreach ($categories as $category) {
-                $selected = selected($mapping['category'] ?? '', $category->term_id, false);
+                $selected = selected($mapping_category, $category->term_id, false);
                 echo '<option value="' . esc_attr((string) $category->term_id) . '"' . $selected . '>' . esc_html($category->name) . '</option>';
             }
 

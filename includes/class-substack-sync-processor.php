@@ -809,10 +809,14 @@ class Substack_Sync_Processor
                 $img->removeAttribute('srcset');
                 $img->removeAttribute('sizes');
                 $rewritten++;
-            }
 
-            if (! $first_attachment) {
-                $first_attachment = $attachment_id;
+                // Only inside this block: a dedup hit against a source-URL meta
+                // row whose attachment was since deleted returns a falsy URL,
+                // and setting that as the featured image would point the
+                // thumbnail at a nonexistent attachment.
+                if (! $first_attachment) {
+                    $first_attachment = $attachment_id;
+                }
             }
         }
 
@@ -1124,8 +1128,10 @@ class Substack_Sync_Processor
 
         $deleted_count = $this->delete_synced_posts('');
 
-        // Clear the remaining log rows (post_id = 0 entries from failed imports)
-        $wpdb->query("DELETE FROM $table_name");
+        // Clear only the leftover post_id = 0 rows (failed imports). Scoping to
+        // post_id = 0 keeps an unscoped DELETE from sweeping the log row of a
+        // post a concurrent sync inserted mid-rollback, which would orphan it.
+        $wpdb->query("DELETE FROM $table_name WHERE post_id = 0");
 
         return $deleted_count;
     }
@@ -1142,8 +1148,10 @@ class Substack_Sync_Processor
 
         $deleted_count = $this->delete_synced_posts("status = 'error'");
 
-        // Remove the remaining failed entries with no post attached
-        $wpdb->delete($table_name, ['status' => 'error'], ['%s']);
+        // Remove only the leftover post_id = 0 error rows; scoping to post_id = 0
+        // keeps this from deleting the log row of a post a concurrent sync just
+        // inserted (and marked error), which would orphan it.
+        $wpdb->delete($table_name, ['status' => 'error', 'post_id' => 0], ['%s', '%d']);
 
         return $deleted_count;
     }
@@ -1171,9 +1179,11 @@ class Substack_Sync_Processor
 
         $deleted_count = $this->delete_synced_posts('sync_date BETWEEN %s AND %s', [$from, $to]);
 
-        // Remove the remaining in-range entries with no post attached
+        // Remove only the leftover post_id = 0 in-range rows; scoping to
+        // post_id = 0 keeps this from deleting the log row of a post a
+        // concurrent sync inserted in-range mid-rollback, which would orphan it.
         $wpdb->query(
-            $wpdb->prepare("DELETE FROM $table_name WHERE sync_date BETWEEN %s AND %s", $from, $to)
+            $wpdb->prepare("DELETE FROM $table_name WHERE post_id = 0 AND sync_date BETWEEN %s AND %s", $from, $to)
         );
 
         return $deleted_count;

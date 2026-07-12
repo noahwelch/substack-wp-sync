@@ -29,7 +29,7 @@ class ReviewFixesTest extends TestCase
         global $_wp_options, $_wp_transients, $_wp_deleted_transients, $_wp_added_filters,
             $_wp_removed_filters, $_wp_sideload_calls, $_wp_sideload_fail, $_wp_thumbnails,
             $_wp_post_id_counter, $_wp_posts, $_wp_post_meta, $_wp_site_transients,
-            $_wp_deleted_site_transients, $_wp_json_responses;
+            $_wp_deleted_site_transients, $_wp_json_responses, $_wp_missing_attachments;
 
         $_wp_post_id_counter = 1000;
         $_wp_posts = [];
@@ -45,6 +45,7 @@ class ReviewFixesTest extends TestCase
         $_wp_sideload_calls = [];
         $_wp_sideload_fail = false;
         $_wp_thumbnails = [];
+        $_wp_missing_attachments = [];
         $_POST = [];
     }
 
@@ -518,6 +519,64 @@ class ReviewFixesTest extends TestCase
         );
         $this->assertNotNull($localized, 'It must return the localized content when an image was rewritten');
         $this->assertStringContainsString('myblog.example.com/wp-content/uploads/', $localized);
+    }
+
+    // Rollback trailing sweeps must be scoped to post_id = 0 (orphan rows) so
+    // they cannot delete the log row of a post a concurrent sync inserted
+    // mid-rollback, which would leave a live post with no tracking row.
+    public function test_rollback_trailing_deletes_only_touch_orphan_rows(): void
+    {
+        $all = $this->extractPhpMethod(self::$processorSource, 'rollback_all_posts');
+        $this->assertStringContainsString('WHERE post_id = 0', $all);
+
+        $failed = $this->extractPhpMethod(self::$processorSource, 'rollback_failed_posts');
+        $this->assertStringContainsString("'post_id' => 0", $failed);
+
+        $byDate = $this->extractPhpMethod(self::$processorSource, 'rollback_posts_by_date');
+        $this->assertStringContainsString('post_id = 0 AND sync_date', $byDate);
+    }
+
+    // esc_attr()/htmlspecialchars() fatals on an array argument; stale option
+    // data can hold a non-scalar keyword/category, and the settings page must
+    // render it instead of white-screening.
+    public function test_settings_page_tolerates_non_scalar_mapping_data(): void
+    {
+        update_option('substack_sync_settings', [
+            'category_mapping' => [
+                ['keyword' => ['unexpected', 'array'], 'category' => 5],
+                'not-an-array-row',
+            ],
+        ]);
+
+        ob_start();
+        (new Substack_Sync_Admin())->category_mapping_callback();
+        $html = ob_get_clean();
+
+        // The array-keyword row still renders (with an empty keyword), and the
+        // scalar (non-array) row is skipped rather than fatalling.
+        $this->assertStringContainsString('category_mapping][0][keyword]', $html);
+        $this->assertStringNotContainsString('category_mapping][1][keyword]', $html);
+    }
+
+    // A dedup hit whose attachment was deleted outside the plugin resolves to no
+    // local URL; that image must not become the featured image (a thumbnail
+    // pointing at a nonexistent attachment) and must not be rewritten.
+    public function test_featured_image_skipped_when_attachment_url_missing(): void
+    {
+        global $_wp_missing_attachments, $_wp_post_meta, $_wp_thumbnails;
+
+        $post_id = wp_insert_post(['post_title' => 'x', 'post_content' => 'p', 'post_status' => 'publish']);
+
+        $src = 'http://8.8.8.8/gone.png';
+        $_wp_post_meta[500] = ['_substack_sync_source_url' => $src]; // prior sync recorded it
+        $_wp_missing_attachments = [500];                            // but it was since deleted
+
+        $processor = new Substack_Sync_Processor();
+        $method = new ReflectionMethod($processor, 'process_post_images');
+        $localized = $method->invoke($processor, $post_id, '<p><img src="' . $src . '"></p>');
+
+        $this->assertArrayNotHasKey($post_id, $_wp_thumbnails, 'Featured image must not point at a since-deleted attachment');
+        $this->assertNull($localized, 'Nothing should be rewritten when the only image resolves to no local URL');
     }
 
     // ---------------------------------------------------------------
