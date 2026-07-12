@@ -174,21 +174,6 @@ class Substack_Sync_Admin
      */
     public function settings_section_callback(): void
     {
-        echo '<div style="background: #fff3cd; border: 1px solid #ffeaa7; border-radius: 4px; padding: 15px; margin-bottom: 20px;">';
-        echo '<h3 style="color: #856404; margin-top: 0;">⚠️ IMPORTANT DISCLAIMER</h3>';
-        echo '<p style="color: #856404; font-weight: bold;">NO SUPPORT IS PROVIDED FOR THIS PLUGIN. USE AT YOUR OWN RISK.</p>';
-        echo '<p style="color: #856404;">This plugin is provided "as is" without warranty. The author is not responsible for any issues, data loss, or damage that may occur from using this plugin.</p>';
-        echo '</div>';
-        
-        echo '<div style="background: #d1ecf1; border: 1px solid #bee5eb; border-radius: 4px; padding: 15px; margin-bottom: 20px;">';
-        echo '<h3 style="color: #0c5460; margin-top: 0;">💙 Support Your Community</h3>';
-        echo '<p style="color: #0c5460;">If this plugin helps you, please consider supporting these worthy causes:</p>';
-        echo '<ul style="color: #0c5460; margin-left: 20px;">';
-        echo '<li><a href="https://gbfb.org?utm_source=substack_sync_plugin&utm_medium=referral" target="_blank" style="color: #0c5460; text-decoration: underline;">Greater Boston Food Bank</a> - Fighting hunger in our communities</li>';
-        echo '<li><a href="https://baypathhumane.org?utm_source=substack_sync_plugin&utm_medium=referral" target="_blank" style="color: #0c5460; text-decoration: underline;">Baypath Humane Society of Hopkinton, Massachusetts</a> - Caring for animals in need</li>';
-        echo '</ul>';
-        echo '<p style="color: #0c5460; font-size: 0.9em; font-style: italic;">Every donation makes a difference in building stronger, more compassionate communities.</p>';
-        echo '</div>';
         echo '<p>Configure your Substack synchronization settings below.</p>';
     }
 
