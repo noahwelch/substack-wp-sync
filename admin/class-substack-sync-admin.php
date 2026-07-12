@@ -502,11 +502,16 @@ class Substack_Sync_Admin
                 });
             });
 
-            // Initialize enhanced sync functionality
-            if (document.getElementById('sync-now-btn')) {
-                new SubstackSyncProgress();
-                new SubstackAdminManager();
-            }
+            // Initialize enhanced sync functionality. Deferred to
+            // DOMContentLoaded: this runs at parse time otherwise, before the
+            // later <script> block that defines SubstackSyncProgress has been
+            // evaluated, throwing "SubstackSyncProgress is not defined".
+            document.addEventListener('DOMContentLoaded', function() {
+                if (document.getElementById('sync-now-btn')) {
+                    new SubstackSyncProgress();
+                    new SubstackAdminManager();
+                }
+            });
 
             class SubstackAdminManager {
                 constructor() {
