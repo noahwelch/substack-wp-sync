@@ -435,6 +435,28 @@ class ReviewFixesTest extends TestCase
         );
     }
 
+    // Regression: the sync-UI bootstrap (`new SubstackSyncProgress()` /
+    // `new SubstackAdminManager()`) used to run at script-parse time, before the
+    // later inline <script> block that defines SubstackSyncProgress had been
+    // evaluated, so the settings page threw "SubstackSyncProgress is not
+    // defined" and the controls never initialized. Both instantiations must sit
+    // inside a DOMContentLoaded handler, which fires only after every inline
+    // script (and the target button) has parsed.
+    public function test_sync_ui_bootstrap_is_deferred_to_domcontentloaded(): void
+    {
+        $deferred = $this->extractDomContentLoadedBodies(self::$adminSource);
+
+        foreach (['new SubstackSyncProgress()', 'new SubstackAdminManager()'] as $call) {
+            $total = substr_count(self::$adminSource, $call);
+            $this->assertGreaterThan(0, $total, "{$call} should be present");
+            $this->assertSame(
+                $total,
+                substr_count($deferred, $call),
+                "{$call} must run only inside a DOMContentLoaded handler, never at script-parse time"
+            );
+        }
+    }
+
     public function test_retry_reset_is_a_single_update_query(): void
     {
         $method = $this->extractPhpMethod(self::$processorSource, 'reset_failed_posts');
@@ -671,5 +693,45 @@ class ReviewFixesTest extends TestCase
         }
 
         self::fail("Could not extract method {$methodName}: unbalanced braces");
+    }
+
+    /**
+     * Concatenate the bodies of every `addEventListener('DOMContentLoaded', ...)`
+     * callback in the source, brace-matched from the callback's opening `{`.
+     *
+     * Same naive brace counting as extractPhpMethod(); fine here because the
+     * handler bodies in this file contain no `{`/`}` inside strings.
+     */
+    private function extractDomContentLoadedBodies(string $source): string
+    {
+        $needle = "addEventListener('DOMContentLoaded'";
+        $bodies = '';
+        $offset = 0;
+        $len = strlen($source);
+
+        while (($pos = strpos($source, $needle, $offset)) !== false) {
+            $brace = strpos($source, '{', $pos);
+            if ($brace === false) {
+                break;
+            }
+
+            $depth = 0;
+            for ($i = $brace; $i < $len; $i++) {
+                if ($source[$i] === '{') {
+                    $depth++;
+                } elseif ($source[$i] === '}') {
+                    $depth--;
+                    if ($depth === 0) {
+                        $bodies .= substr($source, $brace, $i - $brace + 1);
+                        break;
+                    }
+                }
+            }
+
+            // Advance past this match even if unbalanced, so we never loop.
+            $offset = $pos + strlen($needle);
+        }
+
+        return $bodies;
     }
 }
