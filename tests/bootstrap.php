@@ -26,6 +26,22 @@ if (! defined('ABSPATH')) {
 if (! defined('SUBSTACK_SYNC_PLUGIN_DIR')) {
     define('SUBSTACK_SYNC_PLUGIN_DIR', dirname(__DIR__) . '/');
 }
+if (! defined('MINUTE_IN_SECONDS')) {
+    define('MINUTE_IN_SECONDS', 60);
+}
+if (! defined('HOUR_IN_SECONDS')) {
+    define('HOUR_IN_SECONDS', 3600);
+}
+
+// process_post_images() require_onces these wp-admin files; give it empty ones.
+foreach (['wp-admin/includes/media.php', 'wp-admin/includes/file.php', 'wp-admin/includes/image.php'] as $fake_wp_file) {
+    $fake_wp_path = ABSPATH . $fake_wp_file;
+    if (! file_exists($fake_wp_path)) {
+        @mkdir(dirname($fake_wp_path), 0777, true);
+        file_put_contents($fake_wp_path, "<?php\n");
+    }
+}
+unset($fake_wp_file, $fake_wp_path);
 
 // --- WordPress sanitization stubs ---
 
@@ -247,6 +263,7 @@ if (! class_exists('wpdb')) {
     class wpdb
     {
         public string $prefix = 'wp_';
+        public string $postmeta = 'wp_postmeta';
         private array $rows = [];
 
         public function prepare(string $query, ...$args): string
@@ -261,7 +278,39 @@ if (! class_exists('wpdb')) {
 
         public function get_var(string $query)
         {
+            // Support the attachment source-url dedup lookup: resolve it
+            // against the in-memory post-meta store so tests can exercise
+            // "sideload once, reuse forever".
+            if (str_contains($query, '_substack_sync_source_url') && preg_match("/meta_value = '([^']+)'/", $query, $m)) {
+                global $_wp_post_meta;
+                foreach ((array) ($_wp_post_meta ?? []) as $post_id => $meta) {
+                    if (($meta['_substack_sync_source_url'] ?? null) === $m[1]) {
+                        return (string) $post_id;
+                    }
+                }
+            }
+
             return null;
+        }
+
+        public function get_results(string $query, $output = 'OBJECT'): array
+        {
+            return [];
+        }
+
+        public function get_col(string $query): array
+        {
+            return [];
+        }
+
+        public function query(string $query)
+        {
+            return 0;
+        }
+
+        public function delete(string $table, array $where, array $where_format = [])
+        {
+            return 0;
         }
 
         public function replace(string $table, array $data, array $format = []): bool
@@ -276,7 +325,9 @@ if (! class_exists('wpdb')) {
     }
 }
 
-$wpdb = new wpdb();
+// Assign via $GLOBALS: PHPUnit includes this bootstrap inside a function, so
+// a bare `$wpdb = ...` here would be local and `global $wpdb` would be null.
+$GLOBALS['wpdb'] = new wpdb();
 
 // --- WordPress hooks/admin stubs ---
 
@@ -284,8 +335,25 @@ if (! function_exists('add_action')) {
     function add_action(string $hook, $callback, int $priority = 10, int $accepted_args = 1): void {}
 }
 
+$_wp_added_filters = [];
+$_wp_removed_filters = [];
+
 if (! function_exists('add_filter')) {
-    function add_filter(string $hook, $callback, int $priority = 10, int $accepted_args = 1): void {}
+    function add_filter(string $hook, $callback, int $priority = 10, int $accepted_args = 1): void
+    {
+        global $_wp_added_filters;
+        $_wp_added_filters[] = $hook;
+    }
+}
+
+if (! function_exists('remove_filter')) {
+    function remove_filter(string $hook, $callback, int $priority = 10): bool
+    {
+        global $_wp_removed_filters;
+        $_wp_removed_filters[] = $hook;
+
+        return true;
+    }
 }
 
 if (! function_exists('register_setting')) {
@@ -363,19 +431,169 @@ if (! function_exists('get_categories')) {
 }
 
 if (! function_exists('wp_json_encode')) {
-    function wp_json_encode($data): string { return json_encode($data); }
+    function wp_json_encode($data, int $options = 0): string { return json_encode($data, $options); }
 }
 
+$_wp_json_responses = [];
+
 if (! function_exists('wp_send_json_success')) {
-    function wp_send_json_success($data = null): void {}
+    function wp_send_json_success($data = null): void
+    {
+        global $_wp_json_responses;
+        $_wp_json_responses[] = ['type' => 'success', 'data' => $data];
+    }
 }
 
 if (! function_exists('wp_send_json_error')) {
-    function wp_send_json_error($data = null): void {}
+    function wp_send_json_error($data = null): void
+    {
+        global $_wp_json_responses;
+        $_wp_json_responses[] = ['type' => 'error', 'data' => $data];
+    }
 }
 
 if (! function_exists('wp_die')) {
     function wp_die(string $message = ''): void { throw new \RuntimeException($message); }
+}
+
+// --- Transient stubs ---
+
+$_wp_transients = [];
+$_wp_deleted_transients = [];
+
+if (! function_exists('get_transient')) {
+    function get_transient(string $transient)
+    {
+        global $_wp_transients;
+
+        return $_wp_transients[$transient] ?? false;
+    }
+}
+
+if (! function_exists('set_transient')) {
+    function set_transient(string $transient, $value, int $expiration = 0): bool
+    {
+        global $_wp_transients;
+        $_wp_transients[$transient] = $value;
+
+        return true;
+    }
+}
+
+if (! function_exists('delete_transient')) {
+    function delete_transient(string $transient): bool
+    {
+        global $_wp_transients, $_wp_deleted_transients;
+        $_wp_deleted_transients[] = $transient;
+        unset($_wp_transients[$transient]);
+
+        return true;
+    }
+}
+
+// Site transients: a distinct key space from plain transients. WP_Feed_Cache_Transient
+// stores the cached feed here as of WP 6.9, so the manual cache-bust must clear it.
+$_wp_site_transients = [];
+$_wp_deleted_site_transients = [];
+
+if (! function_exists('get_site_transient')) {
+    function get_site_transient(string $transient)
+    {
+        global $_wp_site_transients;
+
+        return $_wp_site_transients[$transient] ?? false;
+    }
+}
+
+if (! function_exists('set_site_transient')) {
+    function set_site_transient(string $transient, $value, int $expiration = 0): bool
+    {
+        global $_wp_site_transients;
+        $_wp_site_transients[$transient] = $value;
+
+        return true;
+    }
+}
+
+if (! function_exists('delete_site_transient')) {
+    function delete_site_transient(string $transient): bool
+    {
+        global $_wp_site_transients, $_wp_deleted_site_transients;
+        $_wp_deleted_site_transients[] = $transient;
+        unset($_wp_site_transients[$transient]);
+
+        return true;
+    }
+}
+
+// --- Feed and media stubs ---
+
+if (! function_exists('fetch_feed')) {
+    function fetch_feed(string $url)
+    {
+        return new WP_Error('feed_error', 'stub fetch_feed: no network in tests');
+    }
+}
+
+$_wp_sideload_calls = [];
+$_wp_sideload_fail = false;
+$_wp_thumbnails = [];
+
+if (! function_exists('media_sideload_image')) {
+    function media_sideload_image(string $src, int $post_id = 0, ?string $desc = null, string $return_type = 'html')
+    {
+        global $_wp_sideload_calls, $_wp_sideload_fail, $_wp_post_id_counter;
+        $_wp_sideload_calls[] = $src;
+
+        if ($_wp_sideload_fail) {
+            return new WP_Error('sideload_failed', 'stub sideload failure');
+        }
+
+        return $_wp_post_id_counter++;
+    }
+}
+
+if (! function_exists('home_url')) {
+    function home_url(string $path = ''): string
+    {
+        return 'https://myblog.example.com' . $path;
+    }
+}
+
+$_wp_missing_attachments = [];
+
+if (! function_exists('wp_get_attachment_url')) {
+    function wp_get_attachment_url(int $attachment_id)
+    {
+        global $_wp_missing_attachments;
+
+        // Simulate an attachment that was deleted outside the plugin: its meta
+        // row still resolves in the dedup lookup, but the URL no longer does.
+        if (in_array($attachment_id, $_wp_missing_attachments, true)) {
+            return false;
+        }
+
+        return 'https://myblog.example.com/wp-content/uploads/' . $attachment_id . '.png';
+    }
+}
+
+if (! function_exists('set_post_thumbnail')) {
+    function set_post_thumbnail($post, int $attachment_id): bool
+    {
+        global $_wp_thumbnails;
+        $_wp_thumbnails[(int) (is_object($post) ? $post->ID : $post)] = $attachment_id;
+
+        return true;
+    }
+}
+
+if (! function_exists('has_post_thumbnail')) {
+    function has_post_thumbnail($post = null): bool
+    {
+        global $_wp_thumbnails;
+
+        return isset($_wp_thumbnails[(int) (is_object($post) ? $post->ID : $post)]);
+    }
 }
 
 // --- Other stubs ---

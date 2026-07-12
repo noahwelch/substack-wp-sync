@@ -252,16 +252,27 @@ class Substack_Sync_Admin
         }
 
         foreach ($mappings as $index => $mapping) {
+            if (! is_array($mapping)) {
+                continue;
+            }
+
+            // esc_attr()/htmlspecialchars() throws a TypeError on an array
+            // argument, and stale or hand-edited option data can hold a
+            // non-scalar keyword/category. Coerce exactly like the processor's
+            // apply_category_mapping() does, so the settings page can't fatal.
+            $keyword = is_scalar($mapping['keyword'] ?? null) ? (string) $mapping['keyword'] : '';
+            $mapping_category = is_scalar($mapping['category'] ?? null) ? $mapping['category'] : '';
+
             echo '<div class="category-mapping-row" style="margin-bottom: 10px; padding: 10px; border: 1px solid #ddd; border-radius: 4px;">';
             echo '<label>Keyword: </label>';
-            echo '<input type="text" name="substack_sync_settings[category_mapping][' . $index . '][keyword]" value="' . esc_attr($mapping['keyword'] ?? '') . '" placeholder="e.g., marketing, tutorial" style="width: 200px; margin-right: 10px;" />';
+            echo '<input type="text" name="substack_sync_settings[category_mapping][' . $index . '][keyword]" value="' . esc_attr($keyword) . '" placeholder="e.g., marketing, tutorial" style="width: 200px; margin-right: 10px;" />';
             echo '<label>Category: </label>';
             echo '<select name="substack_sync_settings[category_mapping][' . $index . '][category]" style="width: 200px; margin-right: 10px;">';
             echo '<option value="">Select Category</option>';
 
             foreach ($categories as $category) {
-                $selected = selected($mapping['category'] ?? '', $category->term_id, false);
-                echo '<option value="' . $category->term_id . '"' . $selected . '>' . esc_html($category->name) . '</option>';
+                $selected = selected($mapping_category, $category->term_id, false);
+                echo '<option value="' . esc_attr((string) $category->term_id) . '"' . $selected . '>' . esc_html($category->name) . '</option>';
             }
 
             echo '</select>';
@@ -272,14 +283,16 @@ class Substack_Sync_Admin
         echo '</div>';
         echo '<button type="button" class="button" onclick="addCategoryMapping()">Add Mapping</button>';
 
-        // JavaScript for dynamic rows
+        // JavaScript for dynamic rows. The category JSON lands in an inline
+        // <script>, so HEX_TAG/HEX_AMP-encode < > & to rule out a </script>
+        // breakout via a crafted term name.
         echo '<script>
         function addCategoryMapping() {
             const container = document.getElementById("category-mapping-container");
             const index = container.children.length;
             const categoryOptions = ' . wp_json_encode(array_map(function ($cat) {
             return ['id' => $cat->term_id, 'name' => $cat->name];
-        }, $categories)) . ';
+        }, $categories), JSON_HEX_TAG | JSON_HEX_AMP) . ';
             
             let optionsHtml = "<option value=\"\">Select Category</option>";
             categoryOptions.forEach(cat => {
@@ -373,8 +386,13 @@ class Substack_Sync_Admin
                         </div>
                     </div>
                     
-                    <?php if ($stats['last_sync_date']): ?>
-                    <p><strong>Last Sync:</strong> <?php echo date('F j, Y g:i a', strtotime($stats['last_sync_date'])); ?></p>
+                    <?php
+                    // Guard the strtotime() result: a false here would be a
+                    // TypeError fatal when passed to date() under strict_types.
+                    $last_sync_ts = $stats['last_sync_date'] ? strtotime((string) $stats['last_sync_date']) : false;
+        ?>
+                    <?php if ($last_sync_ts): ?>
+                    <p><strong>Last Sync:</strong> <?php echo esc_html(date('F j, Y g:i a', $last_sync_ts)); ?></p>
                     <?php endif; ?>
                 </div>
 
@@ -885,34 +903,79 @@ class Substack_Sync_Admin
     }
 
     /**
+     * Shared guard and dispatch for every AJAX handler.
+     *
+     * The five handlers repeated the same buffer/capability/nonce/try-catch
+     * boilerplate; any future drift between them (one had no buffer handling,
+     * one used wp_die) is exactly how holes open up, so it lives here once.
+     *
+     * @param string $log_context Label for error_log and the generic response.
+     * @param callable $handler Receives a Substack_Sync_Processor; must send its own success JSON.
+     */
+    private function handle_ajax_request(string $log_context, callable $handler): void
+    {
+        // Clear any stray notice output so the JSON body stays parseable, but
+        // only when a buffer actually exists: admin-ajax.php does not start
+        // one, and a bare ob_clean() with no buffer emits exactly the kind of
+        // notice it was meant to swallow.
+        if (ob_get_level() > 0) {
+            ob_clean();
+        }
+
+        if (! current_user_can('manage_options')) {
+            wp_send_json_error(['message' => 'Insufficient permissions']);
+
+            return;
+        }
+
+        $nonce = $_POST['_ajax_nonce'] ?? '';
+        if (! is_string($nonce) || ! wp_verify_nonce($nonce, 'substack_sync_nonce')) {
+            wp_send_json_error(['message' => 'Invalid nonce']);
+
+            return;
+        }
+
+        try {
+            require_once SUBSTACK_SYNC_PLUGIN_DIR . 'includes/class-substack-sync-processor.php';
+            $handler(new Substack_Sync_Processor());
+        } catch (Throwable $e) {
+            // Catch Throwable, not just Exception: a TypeError/Error here would
+            // otherwise escape as an uncaught fatal. Log the raw message (which
+            // for Error/TypeError embeds the absolute server path) and return a
+            // generic one so the path is never disclosed in the response.
+            error_log("Substack Sync {$log_context} Error: " . $e->getMessage());
+            wp_send_json_error(['message' => "{$log_context} error. Check the server error log for details."]);
+        }
+    }
+
+    /**
+     * Read a string field from $_POST, rejecting array-valued input.
+     *
+     * @param string $key The $_POST key.
+     * @return string The sanitized value, or '' when absent or non-string.
+     */
+    private function post_string(string $key): string
+    {
+        $value = $_POST[$key] ?? '';
+
+        return is_string($value) ? sanitize_text_field($value) : '';
+    }
+
+    /**
      * Handle AJAX sync now request.
      */
     public function handle_sync_now(): void
     {
-        if (! current_user_can('manage_options')) {
-            wp_die('Insufficient permissions');
-        }
-
-        check_ajax_referer('substack_sync_nonce');
-
-        try {
-            require_once SUBSTACK_SYNC_PLUGIN_DIR . 'includes/class-substack-sync-processor.php';
-            $processor = new Substack_Sync_Processor();
-            $result = $processor->run_sync(true);
+        $this->handle_ajax_request('Sync', function (Substack_Sync_Processor $processor): void {
+            // Manual sync: bypass the feed cache so the click actually refetches.
+            $result = $processor->run_sync(true, true);
 
             if ($result['success']) {
                 wp_send_json_success($result);
             } else {
                 wp_send_json_error($result['error']);
             }
-        } catch (Throwable $e) {
-            // Catch Throwable, not just Exception: a TypeError/Error here would
-            // otherwise escape as an uncaught fatal. Log the raw message (which
-            // for Error/TypeError embeds the absolute server path) and return a
-            // generic one so the path is never disclosed in the response.
-            error_log('Substack Sync Sync Error: ' . $e->getMessage());
-            wp_send_json_error(['message' => 'Sync failed. Check the server error log for details.']);
-        }
+        });
     }
 
     /**
@@ -920,41 +983,23 @@ class Substack_Sync_Admin
      */
     public function handle_batch_sync(): void
     {
-        // Prevent any output before JSON response
-        ob_clean();
+        $this->handle_ajax_request('Sync', function (Substack_Sync_Processor $processor): void {
+            $offset = max(0, intval($_POST['offset'] ?? 0));
+            $batch_size = max(1, intval($_POST['batch_size'] ?? 1));
 
-        if (! current_user_can('manage_options')) {
-            wp_send_json_error(['message' => 'Insufficient permissions']);
-
-            return;
-        }
-
-        if (! wp_verify_nonce($_POST['_ajax_nonce'] ?? '', 'substack_sync_nonce')) {
-            wp_send_json_error(['message' => 'Invalid nonce']);
-
-            return;
-        }
-
-        $offset = intval($_POST['offset'] ?? 0);
-        $batch_size = intval($_POST['batch_size'] ?? 1);
-
-        try {
-            require_once SUBSTACK_SYNC_PLUGIN_DIR . 'includes/class-substack-sync-processor.php';
-            $processor = new Substack_Sync_Processor();
             $result = $processor->run_batch_sync($batch_size, $offset);
 
-            // Ensure clean JSON response
-            wp_send_json_success($result);
-        } catch (Throwable $e) {
-            // Log the raw message but return a generic one: an Error/TypeError
-            // message embeds the absolute server path, re-leaking exactly what
-            // stripping the debug fields from this response set out to close.
-            error_log('Substack Sync AJAX Error: ' . $e->getMessage());
-            wp_send_json_error([
-                'message' => 'Sync error. Check the server error log for details.',
-                'has_more' => false,
-            ]);
-        }
+            // run_batch_sync() reports its own failures (lock held, missing feed
+            // URL, fetch error) inside the payload. Wrapping those in
+            // wp_send_json_success() makes the browser's data.success check pass
+            // on a failed run, so the admin sees a clean 0-post "completed"
+            // instead of the error. Branch on the inner flag like handle_sync_now.
+            if ($result['success']) {
+                wp_send_json_success($result);
+            } else {
+                wp_send_json_error($result['error']);
+            }
+        });
     }
 
     /**
@@ -962,46 +1007,20 @@ class Substack_Sync_Admin
      */
     public function handle_retry_failed(): void
     {
-        ob_clean();
+        $this->handle_ajax_request('Retry', function (Substack_Sync_Processor $processor): void {
+            $retried_count = $processor->reset_failed_posts();
 
-        if (! current_user_can('manage_options')) {
-            wp_send_json_error(['message' => 'Insufficient permissions']);
-
-            return;
-        }
-
-        if (! wp_verify_nonce($_POST['_ajax_nonce'] ?? '', 'substack_sync_nonce')) {
-            wp_send_json_error(['message' => 'Invalid nonce']);
-
-            return;
-        }
-
-        try {
-            require_once SUBSTACK_SYNC_PLUGIN_DIR . 'includes/class-substack-sync-processor.php';
-            $processor = new Substack_Sync_Processor();
-            $failed_posts = $processor->get_posts_needing_retry();
-
-            if (empty($failed_posts)) {
+            if ($retried_count === 0) {
                 wp_send_json_success(['message' => 'No failed posts to retry']);
 
                 return;
-            }
-
-            $retried_count = 0;
-            foreach ($failed_posts as $failed_post) {
-                // Reset retry count to allow retry
-                $processor->reset_post_retry_count($failed_post['substack_guid']);
-                $retried_count++;
             }
 
             wp_send_json_success([
                 'message' => "Reset retry status for {$retried_count} posts. Run sync again to retry them.",
                 'retried_count' => $retried_count,
             ]);
-        } catch (Throwable $e) {
-            error_log('Substack Sync Retry Error: ' . $e->getMessage());
-            wp_send_json_error(['message' => 'Retry error. Check the server error log for details.']);
-        }
+        });
     }
 
     /**
@@ -1009,29 +1028,8 @@ class Substack_Sync_Admin
      */
     public function handle_rollback_posts(): void
     {
-        ob_clean();
-
-        if (! current_user_can('manage_options')) {
-            wp_send_json_error(['message' => 'Insufficient permissions']);
-
-            return;
-        }
-
-        if (! wp_verify_nonce($_POST['_ajax_nonce'] ?? '', 'substack_sync_nonce')) {
-            wp_send_json_error(['message' => 'Invalid nonce']);
-
-            return;
-        }
-
-        $type = sanitize_text_field($_POST['type'] ?? '');
-
-        try {
-            require_once SUBSTACK_SYNC_PLUGIN_DIR . 'includes/class-substack-sync-processor.php';
-            $processor = new Substack_Sync_Processor();
-
-            $deleted_count = 0;
-
-            switch ($type) {
+        $this->handle_ajax_request('Rollback', function (Substack_Sync_Processor $processor): void {
+            switch ($this->post_string('type')) {
                 case 'all':
                     $deleted_count = $processor->rollback_all_posts();
 
@@ -1041,9 +1039,10 @@ class Substack_Sync_Admin
 
                     break;
                 case 'date':
-                    $date_from = sanitize_text_field($_POST['date_from'] ?? '');
-                    $date_to = sanitize_text_field($_POST['date_to'] ?? '');
-                    $deleted_count = $processor->rollback_posts_by_date($date_from, $date_to);
+                    $deleted_count = $processor->rollback_posts_by_date(
+                        $this->post_string('date_from'),
+                        $this->post_string('date_to')
+                    );
 
                     break;
                 default:
@@ -1056,10 +1055,7 @@ class Substack_Sync_Admin
                 'message' => "Successfully removed {$deleted_count} posts from WordPress",
                 'deleted_count' => $deleted_count,
             ]);
-        } catch (Throwable $e) {
-            error_log('Substack Sync Rollback Error: ' . $e->getMessage());
-            wp_send_json_error(['message' => 'Rollback error. Check the server error log for details.']);
-        }
+        });
     }
 
     /**
@@ -1067,31 +1063,10 @@ class Substack_Sync_Admin
      */
     public function handle_get_sync_stats(): void
     {
-        ob_clean();
-
-        if (! current_user_can('manage_options')) {
-            wp_send_json_error(['message' => 'Insufficient permissions']);
-
-            return;
-        }
-
-        if (! wp_verify_nonce($_POST['_ajax_nonce'] ?? '', 'substack_sync_nonce')) {
-            wp_send_json_error(['message' => 'Invalid nonce']);
-
-            return;
-        }
-
-        try {
-            require_once SUBSTACK_SYNC_PLUGIN_DIR . 'includes/class-substack-sync-processor.php';
-            $processor = new Substack_Sync_Processor();
-            $logs = $processor->get_recent_sync_logs(50);
-
+        $this->handle_ajax_request('Stats', function (Substack_Sync_Processor $processor): void {
             wp_send_json_success([
-                'logs' => $logs,
+                'logs' => $processor->get_recent_sync_logs(50),
             ]);
-        } catch (Throwable $e) {
-            error_log('Substack Sync Stats Error: ' . $e->getMessage());
-            wp_send_json_error(['message' => 'Stats error. Check the server error log for details.']);
-        }
+        });
     }
 }
