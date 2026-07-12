@@ -522,9 +522,13 @@ class Substack_Sync_Processor
         }
 
         // Localize images before the single write: the post already exists, so
-        // its ID is available for sideloading, and writing already-localized
-        // content means an unchanged hourly sync matches what is stored, so
-        // WordPress skips the revision and post_modified bump entirely.
+        // its ID is available for sideloading, and folding the localized content
+        // into this one write means an unchanged hourly sync stores content
+        // identical to what is already there, so WordPress creates no new
+        // revision. (post_modified is still bumped: wp_insert_post() sets it on
+        // every update regardless of whether any field changed. Suppressing that
+        // would require a change-detection guard before the write, not just
+        // matching content.)
         $localized = $this->process_post_images((int) $post_data['ID'], $post_data['post_content']);
         if ($localized !== null) {
             $post_data['post_content'] = $localized;
@@ -625,7 +629,7 @@ class Substack_Sync_Processor
         // replacement let `$1`-style sequences in the URL corrupt it.
         $doc = new DOMDocument();
         $loaded = @$doc->loadHTML(
-            '<?xml encoding="utf-8"?><div>' . $content . '</div>',
+            '<?xml encoding="utf-8"?><div>' . $this->encode_stray_lt($content) . '</div>',
             LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD
         );
         $wrapper = $doc->documentElement;
@@ -655,6 +659,28 @@ class Substack_Sync_Processor
         }
 
         return $html;
+    }
+
+    /**
+     * Encode stray `<` that do not begin a tag before a fragment is handed to
+     * DOMDocument::loadHTML().
+     *
+     * libxml's HTML parser discards the text following a bare `<` that is not
+     * part of a valid tag (e.g. "Revenue < 5000" or an inline code sample), so
+     * a raw `<` in prose would silently truncate the rest of the post. This
+     * runs on raw feed content (process_content() executes before wp_kses_post),
+     * and well-formed feeds usually pre-encode these, but the parser must never
+     * eat real text. Only a `<` followed by a tag-name character, `/`, `!`, or
+     * `?` is treated as real markup and left alone.
+     *
+     * @param string $content The raw fragment.
+     * @return string The fragment with stray `<` encoded.
+     */
+    private function encode_stray_lt(string $content): string
+    {
+        // preg_replace returns null only on PCRE failure; fall back to the
+        // input so a pathological string is never turned into null.
+        return preg_replace('/<(?![a-zA-Z\/!?])/', '&lt;', $content) ?? $content;
     }
 
     /**
@@ -711,9 +737,10 @@ class Substack_Sync_Processor
      * effects, but does NOT write the post: it returns the localized HTML so the
      * caller folds it into a single wp_update_post(). Localizing before the
      * caller's only write means an unchanged hourly sync produces content
-     * identical to what is stored, so WordPress creates no revision and does not
-     * bump post_modified. Writing here separately (as an earlier version did)
-     * doubled revisions on every image post, every hour, forever.
+     * identical to what is stored, so WordPress creates no new revision. Writing
+     * here separately (as an earlier version did) doubled revisions on every
+     * image post, every hour, forever. (This does not stop post_modified from
+     * being bumped: wp_insert_post() sets it on every update regardless.)
      *
      * @param int $post_id The WordPress post ID.
      * @param string $content The post content.
@@ -734,7 +761,7 @@ class Substack_Sync_Processor
 
         $doc = new DOMDocument();
         $loaded = @$doc->loadHTML(
-            '<?xml encoding="utf-8"?><div>' . $content . '</div>',
+            '<?xml encoding="utf-8"?><div>' . $this->encode_stray_lt($content) . '</div>',
             LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD
         );
         $wrapper = $doc->documentElement;

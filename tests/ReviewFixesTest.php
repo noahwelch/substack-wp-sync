@@ -215,6 +215,38 @@ class ReviewFixesTest extends TestCase
         $this->assertSame($content, $this->invokeProcessContent($content), 'Content without Substack widgets must not be rewritten at all');
     }
 
+    // process_content() runs on raw feed content (before wp_kses_post). libxml's
+    // HTML parser discards text after a bare `<` that does not begin a tag, so a
+    // raw `<` in prose used to silently truncate the post once the content also
+    // tripped the "subscription"/"like-button" DOM-cleanup gate.
+    public function test_process_content_preserves_bare_lt_in_prose(): void
+    {
+        update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
+
+        $output = $this->invokeProcessContent('<p>Revenue < 5000 this month. Consider a subscription!</p>');
+
+        $this->assertStringContainsString('5000 this month', $output, 'Text after a bare < must not be dropped');
+        $this->assertStringContainsString('Consider a subscription', $output);
+    }
+
+    public function test_process_content_preserves_bare_lt_while_removing_widget(): void
+    {
+        update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
+
+        $output = $this->invokeProcessContent(
+            '<p>Use <code>if (x < 5) return</code> in code.</p>'
+            . '<div class="subscription-widget">join</div><p>tail text</p>'
+        );
+
+        // The bug dropped everything from the bare `<` to the next tag boundary.
+        $this->assertStringContainsString('in code.', $output, 'Prose after the code sample must survive');
+        $this->assertStringContainsString('tail text', $output);
+        $this->assertStringContainsString('5) return', $output, 'The code sample operands must survive');
+        // Widget removal and subscribe-block insertion still work.
+        $this->assertStringNotContainsString('subscription-widget', $output);
+        $this->assertStringContainsString('substack-subscribe-block', $output);
+    }
+
     // ---------------------------------------------------------------
     // SSRF guard: filter_var reports CGNAT (RFC 6598) and 192.0.0.0/24
     // (RFC 6890) as public, so those literals slipped past the guard.
