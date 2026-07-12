@@ -26,6 +26,9 @@ if (! defined('ABSPATH')) {
 if (! defined('SUBSTACK_SYNC_PLUGIN_DIR')) {
     define('SUBSTACK_SYNC_PLUGIN_DIR', dirname(__DIR__) . '/');
 }
+if (! defined('ARRAY_A')) {
+    define('ARRAY_A', 'ARRAY_A');
+}
 if (! defined('MINUTE_IN_SECONDS')) {
     define('MINUTE_IN_SECONDS', 60);
 }
@@ -293,8 +296,20 @@ if (! class_exists('wpdb')) {
             return null;
         }
 
-        public function get_results(string $query, $output = 'OBJECT'): array
+        // No return type: real $wpdb::get_results() returns null on a query
+        // error, and tests seed null to exercise that path.
+        public function get_results(string $query, $output = 'OBJECT')
         {
+            // Seedable by tests: map a query-substring needle to the rows it
+            // should return (or null to simulate a query error), mirroring the
+            // get_var() dedup shim above.
+            global $_wp_get_results_rows;
+            foreach ((array) ($_wp_get_results_rows ?? []) as $needle => $rows) {
+                if (str_contains($query, (string) $needle)) {
+                    return $rows;
+                }
+            }
+
             return [];
         }
 

@@ -6,7 +6,7 @@ declare(strict_types=1);
  * Plugin Name:       Substack Sync
  * Plugin URI:        https://www.christopherspenn.com/2025/08/substack-sync-for-wordpress/
  * Description:       A fork of Christopher S. Penn's Substack Sync, with additional bug fixes and hardening. Syncs a Substack RSS feed to your WordPress site. NO SUPPORT PROVIDED. Use at your own risk. If it lights your computer on fire, it's not the author's fault.
- * Version:           1.1.1
+ * Version:           1.2.0
  * Author:            Christopher S. Penn
  * Author URI:        https://www.christopherspenn.com/
  * Fork Maintainer:   Noah Welch
@@ -25,7 +25,7 @@ if (! defined('WPINC')) {
 }
 
 // Define Plugin Constants
-define('SUBSTACK_SYNC_VERSION', '1.1.1');
+define('SUBSTACK_SYNC_VERSION', '1.2.0');
 define('SUBSTACK_SYNC_PLUGIN_DIR', plugin_dir_path(__FILE__));
 
 /**
@@ -57,3 +57,26 @@ require_once SUBSTACK_SYNC_PLUGIN_DIR . 'includes/class-substack-sync-processor.
 // Initialize the classes
 new Substack_Sync_Admin();
 new Substack_Sync_Cron();
+
+/**
+ * One-time backfill of the Substack source-URL post meta for posts imported
+ * before that meta was recorded. Cheap after the first run: the processor's
+ * own option-flag guard short-circuits, and the flag check here avoids even
+ * constructing the processor once the backfill is done.
+ *
+ * admin_init also fires on admin-ajax.php requests (including unauthenticated
+ * wp_ajax_nopriv_* actions), so gate to a real admin page load by a capable
+ * user. This keeps an anonymous or low-privilege request from paying the
+ * one-time scan-and-write cost.
+ */
+function substack_sync_maybe_backfill_source_urls(): void
+{
+    if (wp_doing_ajax() || ! current_user_can('manage_options')) {
+        return;
+    }
+    if (get_option('substack_sync_source_url_backfilled')) {
+        return;
+    }
+    (new Substack_Sync_Processor())->backfill_source_urls();
+}
+add_action('admin_init', 'substack_sync_maybe_backfill_source_urls');
