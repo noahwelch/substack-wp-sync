@@ -826,7 +826,7 @@ class Substack_Sync_Processor
                 }
 
                 $new_downloads++;
-                $result = media_sideload_image($src, $post_id, '', 'id');
+                $result = $this->sideload_remote_image($src, $post_id);
 
                 if (is_wp_error($result)) {
                     $failed_downloads++;
@@ -874,6 +874,78 @@ class Substack_Sync_Processor
         }
 
         return null;
+    }
+
+    /**
+     * Download then media_handle_sideload() so extension-less CDN URLs (Unsplash
+     * hotlinks) media_sideload_image() rejects still attach. Returns id/WP_Error.
+     */
+    private function sideload_remote_image(string $src, int $post_id)
+    {
+        $tmp = download_url($src);
+        if (is_wp_error($tmp)) {
+            return $tmp;
+        }
+
+        $filename = $this->filename_for_sideload($src, (string) $tmp);
+        if ($filename === '') {
+            @unlink($tmp);
+
+            return new WP_Error(
+                'substack_sync_unrecognized_image',
+                'Downloaded file is not a supported image type: ' . $src
+            );
+        }
+
+        $file_array = ['name' => $filename, 'tmp_name' => $tmp];
+        $attachment_id = media_handle_sideload($file_array, $post_id);
+
+        if (is_wp_error($attachment_id)) {
+            // media_handle_sideload() deletes tmp itself when it moves the file;
+            // unlink covers the WP_Error path where it never got that far.
+            @unlink($file_array['tmp_name']);
+
+            return $attachment_id;
+        }
+
+        return (int) $attachment_id;
+    }
+
+    /**
+     * Sideload filename with a real extension sniffed from the bytes (the URL
+     * may carry none), or '' when the download is not a supported image.
+     */
+    private function filename_for_sideload(string $src, string $tmp_file): string
+    {
+        $ext = '';
+
+        $info = @getimagesize($tmp_file);
+        if (is_array($info) && isset($info[2])) {
+            $ext = ltrim((string) image_type_to_extension($info[2], false), '.');
+        }
+
+        // Fall back to an extension carried by the URL path itself.
+        if ($ext === '') {
+            $path_ext = strtolower(pathinfo((string) wp_parse_url($src, PHP_URL_PATH), PATHINFO_EXTENSION));
+            if (in_array($path_ext, ['jpg', 'jpeg', 'png', 'gif', 'webp'], true)) {
+                $ext = $path_ext;
+            }
+        }
+
+        if ($ext === '') {
+            return '';
+        }
+        if ($ext === 'jpeg') {
+            $ext = 'jpg';
+        }
+
+        $base = wp_basename((string) wp_parse_url($src, PHP_URL_PATH));
+        $name = $base !== '' ? (string) preg_replace('/\.[^.]*$/', '', $base) : '';
+        if (trim($name) === '') {
+            $name = 'substack-image';
+        }
+
+        return sanitize_file_name($name . '.' . $ext);
     }
 
     /**

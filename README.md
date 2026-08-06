@@ -60,7 +60,7 @@ Navigate to **Settings > Substack Sync** in your WordPress admin to configure:
 
 ## Requirements
 
-- WordPress 6.0 or higher
+- WordPress 6.5 or higher
 - PHP 8.0 or higher
 - Tested up to WordPress 7.0
 

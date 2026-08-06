@@ -558,6 +558,12 @@ if (! function_exists('media_sideload_image')) {
     function media_sideload_image(string $src, int $post_id = 0, ?string $desc = null, string $return_type = 'html')
     {
         global $_wp_sideload_calls, $_wp_sideload_fail, $_wp_post_id_counter;
+
+        // Faithful to WP: reject any URL with no image extension before the '?'.
+        if (! preg_match('/[^\?]+\.(?:jpe?g|jpe|gif|png|webp)\b/i', $src)) {
+            return new WP_Error('image_sideload_failed', 'Invalid image URL');
+        }
+
         $_wp_sideload_calls[] = $src;
 
         if ($_wp_sideload_fail) {
@@ -565,6 +571,63 @@ if (! function_exists('media_sideload_image')) {
         }
 
         return $_wp_post_id_counter++;
+    }
+}
+
+if (! function_exists('download_url')) {
+    function download_url(string $url, int $timeout = 300)
+    {
+        global $_wp_sideload_calls, $_wp_sideload_fail, $_wp_download_bytes;
+        $_wp_sideload_calls[] = $url;
+
+        if ($_wp_sideload_fail) {
+            return new WP_Error('download_failed', 'stub download failure');
+        }
+
+        // Default to real 1x1 PNG bytes so getimagesize() sniffs an image; a
+        // test may seed $_wp_download_bytes to simulate a non-image download.
+        $tmp = tempnam(sys_get_temp_dir(), 'substack-img');
+        file_put_contents(
+            $tmp,
+            $_wp_download_bytes ?? base64_decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC')
+        );
+
+        return $tmp;
+    }
+}
+
+if (! function_exists('media_handle_sideload')) {
+    function media_handle_sideload(array $file, int $post_id = 0, ?string $desc = null, array $post_data = [])
+    {
+        global $_wp_post_id_counter, $_wp_media_handle_fail;
+
+        // Real WP moves the temp file on success (and on its own copy failure);
+        // mirror the delete so tests don't litter the temp dir either way.
+        if (isset($file['tmp_name']) && is_string($file['tmp_name']) && file_exists($file['tmp_name'])) {
+            @unlink($file['tmp_name']);
+        }
+
+        if ($_wp_media_handle_fail) {
+            return new WP_Error('sideload_failed', 'stub media_handle_sideload failure');
+        }
+
+        return $_wp_post_id_counter++;
+    }
+}
+
+if (! function_exists('wp_basename')) {
+    function wp_basename(string $path, string $suffix = ''): string
+    {
+        return basename(str_replace('\\', '/', $path), $suffix);
+    }
+}
+
+if (! function_exists('sanitize_file_name')) {
+    function sanitize_file_name(string $filename): string
+    {
+        $filename = (string) preg_replace('/[^A-Za-z0-9._-]/', '', $filename);
+
+        return trim($filename, '.-');
     }
 }
 
