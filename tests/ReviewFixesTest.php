@@ -30,8 +30,10 @@ class ReviewFixesTest extends TestCase
             $_wp_removed_filters, $_wp_sideload_calls, $_wp_sideload_fail, $_wp_thumbnails,
             $_wp_post_id_counter, $_wp_posts, $_wp_post_meta, $_wp_site_transients,
             $_wp_deleted_site_transients, $_wp_json_responses, $_wp_missing_attachments,
-            $_wp_get_results_rows;
+            $_wp_get_results_rows, $_wp_download_bytes, $_wp_media_handle_fail;
 
+        $_wp_download_bytes = null;
+        $_wp_media_handle_fail = false;
         $_wp_get_results_rows = [];
         $_wp_post_id_counter = 1000;
         $_wp_posts = [];
@@ -402,6 +404,52 @@ class ReviewFixesTest extends TestCase
         $saved = get_post($post_id)->post_content;
         $this->assertStringNotContainsString('images.unsplash.com', $saved, 'Content must be rewritten to the local copy');
         $this->assertStringContainsString('myblog.example.com/wp-content/uploads/', $saved);
+    }
+
+    public function test_url_extension_fallback_when_bytes_are_unsniffable(): void
+    {
+        global $_wp_download_bytes, $_wp_thumbnails;
+
+        // Downloaded bytes getimagesize() cannot identify (e.g. a truncated
+        // file): the extension must fall back to the one in the URL path.
+        $_wp_download_bytes = 'not a valid image';
+        $post_id = wp_insert_post(['post_title' => 'x', 'post_content' => 'p', 'post_status' => 'publish']);
+
+        $localized = $this->invokeProcessPostImages($post_id, '<p><img src="http://8.8.8.8/cover.jpg"></p>');
+
+        $this->assertNotNull($localized, 'A URL-extension fallback must still localize the image');
+        $this->assertArrayHasKey($post_id, $_wp_thumbnails, 'The fallback-typed image must become the featured image');
+        $this->assertStringContainsString('myblog.example.com/wp-content/uploads/', get_post($post_id)->post_content);
+    }
+
+    public function test_unrecognized_image_is_skipped_without_a_thumbnail(): void
+    {
+        global $_wp_download_bytes, $_wp_sideload_calls, $_wp_thumbnails;
+
+        // Non-image bytes AND an extension-less URL: no type is derivable, so
+        // the sideload must fail gracefully, not store a bogus attachment.
+        $_wp_download_bytes = 'not a valid image';
+        $post_id = wp_insert_post(['post_title' => 'x', 'post_content' => 'p', 'post_status' => 'publish']);
+
+        $localized = $this->invokeProcessPostImages($post_id, '<p><img src="https://images.unsplash.com/photo-abc?fm=jpg&w=1080"></p>');
+
+        $this->assertNull($localized, 'An unrecognized download must not rewrite content');
+        $this->assertArrayNotHasKey($post_id, $_wp_thumbnails, 'No featured image for an unrecognized download');
+        $this->assertCount(1, $_wp_sideload_calls, 'The download was still attempted');
+    }
+
+    public function test_media_handle_sideload_failure_is_handled(): void
+    {
+        global $_wp_media_handle_fail, $_wp_sideload_calls, $_wp_thumbnails;
+
+        $_wp_media_handle_fail = true;
+        $post_id = wp_insert_post(['post_title' => 'x', 'post_content' => 'p', 'post_status' => 'publish']);
+
+        $localized = $this->invokeProcessPostImages($post_id, '<p><img src="http://8.8.8.8/a.png"></p>');
+
+        $this->assertNull($localized, 'A media_handle_sideload() failure must not rewrite content');
+        $this->assertArrayNotHasKey($post_id, $_wp_thumbnails, 'No featured image when the attachment could not be created');
+        $this->assertCount(1, $_wp_sideload_calls, 'The download was attempted before the sideload failed');
     }
 
     // ---------------------------------------------------------------

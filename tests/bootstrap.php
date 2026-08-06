@@ -577,18 +577,19 @@ if (! function_exists('media_sideload_image')) {
 if (! function_exists('download_url')) {
     function download_url(string $url, int $timeout = 300)
     {
-        global $_wp_sideload_calls, $_wp_sideload_fail;
+        global $_wp_sideload_calls, $_wp_sideload_fail, $_wp_download_bytes;
         $_wp_sideload_calls[] = $url;
 
         if ($_wp_sideload_fail) {
             return new WP_Error('download_failed', 'stub download failure');
         }
 
-        // Real (1x1) PNG bytes so the processor's getimagesize() sniff works.
+        // Default to real 1x1 PNG bytes so getimagesize() sniffs an image; a
+        // test may seed $_wp_download_bytes to simulate a non-image download.
         $tmp = tempnam(sys_get_temp_dir(), 'substack-img');
         file_put_contents(
             $tmp,
-            base64_decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC')
+            $_wp_download_bytes ?? base64_decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC')
         );
 
         return $tmp;
@@ -598,11 +599,16 @@ if (! function_exists('download_url')) {
 if (! function_exists('media_handle_sideload')) {
     function media_handle_sideload(array $file, int $post_id = 0, ?string $desc = null, array $post_data = [])
     {
-        global $_wp_post_id_counter;
+        global $_wp_post_id_counter, $_wp_media_handle_fail;
 
-        // Real WP moves the temp file on success; mirror that so tests don't litter.
+        // Real WP moves the temp file on success (and on its own copy failure);
+        // mirror the delete so tests don't litter the temp dir either way.
         if (isset($file['tmp_name']) && is_string($file['tmp_name']) && file_exists($file['tmp_name'])) {
             @unlink($file['tmp_name']);
+        }
+
+        if ($_wp_media_handle_fail) {
+            return new WP_Error('sideload_failed', 'stub media_handle_sideload failure');
         }
 
         return $_wp_post_id_counter++;

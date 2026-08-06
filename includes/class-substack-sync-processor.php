@@ -901,7 +901,8 @@ class Substack_Sync_Processor
         $attachment_id = media_handle_sideload($file_array, $post_id);
 
         if (is_wp_error($attachment_id)) {
-            // media_handle_sideload() removes the temp file on success only.
+            // media_handle_sideload() deletes tmp itself when it moves the file;
+            // unlink covers the WP_Error path where it never got that far.
             @unlink($file_array['tmp_name']);
 
             return $attachment_id;
