@@ -384,6 +384,26 @@ class ReviewFixesTest extends TestCase
         $this->assertSame(999, $_wp_thumbnails[$post_id], 'An existing featured image must not be overwritten');
     }
 
+    public function test_extensionless_image_url_is_sideloaded_and_set_as_thumbnail(): void
+    {
+        global $_wp_sideload_calls, $_wp_thumbnails;
+
+        $post_id = wp_insert_post(['post_title' => 'x', 'post_content' => 'p', 'post_status' => 'publish']);
+
+        // Substack hotlinks images from Unsplash-style CDNs whose path carries
+        // no extension before the query string. media_sideload_image() rejects
+        // these; the sideload must still succeed by sniffing the downloaded type.
+        $src = 'https://images.unsplash.com/photo-1611463537830-69624771b809?fm=jpg&w=1080';
+        $this->invokeProcessPostImages($post_id, '<p><img src="' . $src . '"></p>');
+
+        $this->assertCount(1, $_wp_sideload_calls, 'The extension-less remote image must be fetched');
+        $this->assertArrayHasKey($post_id, $_wp_thumbnails, 'The sideloaded image must become the featured image');
+
+        $saved = get_post($post_id)->post_content;
+        $this->assertStringNotContainsString('images.unsplash.com', $saved, 'Content must be rewritten to the local copy');
+        $this->assertStringContainsString('myblog.example.com/wp-content/uploads/', $saved);
+    }
+
     // ---------------------------------------------------------------
     // Category mapping: byte-wise strtolower() never matched accented
     // keywords against differently-cased content.
