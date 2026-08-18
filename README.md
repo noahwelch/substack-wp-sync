@@ -6,7 +6,7 @@ This is a fork of the original [Substack Sync](https://www.christopherspenn.com/
 
 - **Original author:** Christopher S. Penn (https://www.christopherspenn.com/)
 - **Fork maintainer:** Noah Welch
-- **Version:** 1.2.1
+- **Version:** 1.3.0
 - **License:** Apache-2.0
 
 ## Description
@@ -18,6 +18,7 @@ Substack Sync imports posts from a Substack RSS feed into WordPress and keeps ex
 - **Automated Synchronization:** Hourly cron job fetches new content from the Substack RSS feed
 - **Intelligent Content Management:** Imports new posts and updates existing ones with GUID-based tracking
 - **Image Localization:** Sideloads each post image into the Media Library once (deduped by source URL), rewrites post content to serve the local copies, and sets the first as the featured image
+- **Video Embeds:** Rewrites Substack's YouTube embeds into a linked thumbnail before sanitization, so video posts keep an image (and a featured image) instead of losing the iframe to `wp_kses_post()`
 - **Batch Processing:** Progressive sync system with detailed progress tracking and real-time status updates
 - **Error Handling and Retry Logic:** Automatic retry system for failed imports (up to 3 attempts) with detailed error logging
 - **Content Processing:** Removes Substack-specific elements and replaces them with customizable subscription links
@@ -97,7 +98,7 @@ substack-sync/
 3. **GUID Tracking:** Compares Substack post GUIDs against the database to identify new/updated content
 4. **Content Import:** Creates new WordPress posts or updates existing ones based on GUID matching
 5. **Media Handling:** Sideloads each image once via `media_sideload_image()` (deduped by source URL), rewrites content to serve the local copies, and sets the first as the featured image
-6. **Content Processing:** Removes Substack-specific elements (subscription boxes, like buttons) and adds custom subscription links
+6. **Content Processing:** Removes Substack-specific elements (subscription boxes, like buttons), adds custom subscription links, and swaps YouTube embeds for a linked thumbnail
 7. **Category Assignment:** Applies keyword-based category mapping if configured
 8. **Error Handling:** Logs failures with detailed error messages and retry tracking
 

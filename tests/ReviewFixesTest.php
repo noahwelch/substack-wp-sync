@@ -252,6 +252,110 @@ class ReviewFixesTest extends TestCase
     }
 
     // ---------------------------------------------------------------
+    // YouTube embeds: Substack ships them as an <iframe>, which
+    // wp_kses_post() strips, so video posts arrived with an empty
+    // wrapper div and no image. They are rewritten to a linked
+    // thumbnail before sanitization.
+    // ---------------------------------------------------------------
+
+    public function test_process_content_replaces_youtube_embed_with_linked_thumbnail(): void
+    {
+        update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
+
+        // Verbatim shape from sovereigngrace.substack.com/feed. Deliberately
+        // carries no subscribe or like widget: a video-only post must still
+        // reach the DOM pass rather than short-circuit on the cheap pre-check.
+        $output = $this->invokeProcessContent(
+            '<div id="youtube2-KNFJSIj6xfQ" class="youtube-wrap" data-attrs="{&quot;videoId&quot;:&quot;KNFJSIj6xfQ&quot;,&quot;startTime&quot;:null}"'
+            . ' data-component-name="Youtube2ToDOM"><div class="youtube-inner">'
+            . '<iframe src="https://www.youtube-nocookie.com/embed/KNFJSIj6xfQ?rel=0" width="728" height="409"></iframe>'
+            . '</div></div><h1>Why this episode matters</h1>'
+        );
+
+        $this->assertStringNotContainsString('youtube-wrap', $output, 'The stripped-iframe wrapper must not survive');
+        $this->assertStringNotContainsString('<iframe', $output);
+        $this->assertStringContainsString('substack-video-embed', $output);
+        $this->assertStringContainsString('src="https://img.youtube.com/vi/KNFJSIj6xfQ/hqdefault.jpg"', $output);
+        $this->assertStringContainsString('href="https://www.youtube.com/watch?v=KNFJSIj6xfQ"', $output);
+        $this->assertStringContainsString('<h1>Why this episode matters</h1>', $output, 'Body copy after the embed must survive');
+    }
+
+    public function test_youtube_id_falls_back_to_the_element_id_when_data_attrs_are_missing(): void
+    {
+        update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
+
+        // "noBX7D2-7hA" contains a hyphen, so a split-on-first-hyphen parse of
+        // the element id would truncate it to "noBX7D2" and 404 the thumbnail.
+        $output = $this->invokeProcessContent(
+            '<div id="youtube2-noBX7D2-7hA" class="youtube-wrap"><iframe src="https://www.youtube-nocookie.com/embed/noBX7D2-7hA"></iframe></div>'
+        );
+
+        $this->assertStringContainsString('vi/noBX7D2-7hA/hqdefault.jpg', $output);
+        $this->assertStringContainsString('watch?v=noBX7D2-7hA', $output);
+    }
+
+    public function test_unparseable_youtube_wrapper_is_left_alone(): void
+    {
+        update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
+
+        // No usable id anywhere. Feed values reach the URL builders, so an
+        // unvalidated one must yield no node at all rather than a bogus link.
+        $output = $this->invokeProcessContent(
+            '<div class="youtube-wrap" data-attrs="not json"><iframe src="https://example.com/e"></iframe></div>'
+        );
+
+        $this->assertStringNotContainsString('substack-video-embed', $output);
+        $this->assertStringNotContainsString('img.youtube.com', $output);
+    }
+
+    public function test_video_id_with_url_metacharacters_is_rejected(): void
+    {
+        update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
+
+        $output = $this->invokeProcessContent(
+            '<div class="youtube-wrap" data-attrs=\'{"videoId":"abc/../../evil?x=1"}\'><iframe src="https://example.com/e"></iframe></div>'
+        );
+
+        // The wrapper passes through untouched (data-attrs and all); what must
+        // not happen is a URL getting built out of that value.
+        $this->assertStringNotContainsString('substack-video-embed', $output);
+        $this->assertStringNotContainsString('img.youtube.com', $output);
+        $this->assertStringNotContainsString('youtube.com/watch', $output);
+    }
+
+    public function test_video_thumbnail_survives_kses_and_becomes_the_featured_image(): void
+    {
+        global $_wp_sideload_calls, $_wp_thumbnails, $_wp_post_meta;
+
+        update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
+
+        // Walk the real pipeline order: process_content(), then wp_kses_post()
+        // (which is what ate the original iframe), then image localization.
+        $content = wp_kses_post($this->invokeProcessContent(
+            '<div id="youtube2-KNFJSIj6xfQ" class="youtube-wrap" data-attrs="{&quot;videoId&quot;:&quot;KNFJSIj6xfQ&quot;}">'
+            . '<iframe src="https://www.youtube-nocookie.com/embed/KNFJSIj6xfQ"></iframe></div>'
+            . '<p>Body</p><img src="https://cdn.example.com/later-photo.jpg">'
+        ));
+
+        $this->assertStringContainsString('img.youtube.com', $content, 'The thumbnail must survive wp_kses_post');
+
+        $post_id = wp_insert_post(['post_title' => 'Video post', 'post_content' => $content, 'post_status' => 'publish']);
+        $this->invokeProcessPostImages($post_id, $content);
+
+        $this->assertSame(
+            'https://img.youtube.com/vi/KNFJSIj6xfQ/hqdefault.jpg',
+            $_wp_sideload_calls[0] ?? null,
+            'The thumbnail must be sideloaded into the media library like any other image'
+        );
+        $this->assertArrayHasKey($post_id, $_wp_thumbnails, 'A video post must end up with a featured image');
+        $this->assertSame(
+            'https://img.youtube.com/vi/KNFJSIj6xfQ/hqdefault.jpg',
+            $_wp_post_meta[$_wp_thumbnails[$post_id]]['_substack_sync_source_url'] ?? null,
+            'The embed leads the post, so the video frame wins the featured slot over the later body photo'
+        );
+    }
+
+    // ---------------------------------------------------------------
     // SSRF guard: filter_var reports CGNAT (RFC 6598) and 192.0.0.0/24
     // (RFC 6890) as public, so those literals slipped past the guard.
     // ---------------------------------------------------------------

@@ -632,7 +632,11 @@ class Substack_Sync_Processor
     private function process_content(string $content): string
     {
         // Cheap pre-check so untouched posts skip the DOM round-trip entirely.
-        if (stripos($content, 'subscription') === false && stripos($content, 'like-button') === false) {
+        if (
+            stripos($content, 'subscription') === false
+            && stripos($content, 'like-button') === false
+            && stripos($content, 'youtube-wrap') === false
+        ) {
             return $content;
         }
 
@@ -664,6 +668,24 @@ class Substack_Sync_Processor
             if ($node !== $wrapper && $this->is_attached($node)) {
                 $node->parentNode->removeChild($node);
             }
+        }
+
+        // Substack embeds video as an <iframe>, which wp_kses_post() strips
+        // (iframe is not an allowed post tag), leaving an empty wrapper div and
+        // no image at all. Swap in a linked thumbnail: it survives kses, is
+        // sideloaded by process_post_images(), and because the embed leads the
+        // post it becomes the featured image on video posts.
+        foreach ($xpath->query('//div[contains(@class, "youtube-wrap")]') as $node) {
+            if ($node === $wrapper || ! $this->is_attached($node)) {
+                continue;
+            }
+
+            $video_id = $this->youtube_id_from_wrapper($node);
+            if ($video_id === null) {
+                continue;
+            }
+
+            $node->parentNode->replaceChild($this->build_video_thumbnail_node($doc, $video_id), $node);
         }
 
         $html = '';
@@ -721,6 +743,67 @@ class Substack_Sync_Processor
         $div->appendChild($link);
 
         return $div;
+    }
+
+    /**
+     * Extract the YouTube video ID from a Substack embed wrapper.
+     *
+     * Substack writes the id twice, as JSON in data-attrs and in the element id
+     * ("youtube2-<ID>"). Read data-attrs first and fall back to the element id,
+     * since either alone has changed shape across Substack editor versions.
+     *
+     * @param DOMElement $node The youtube-wrap div.
+     * @return string|null The video ID, or null when it is absent or malformed.
+     */
+    private function youtube_id_from_wrapper(DOMElement $node): ?string
+    {
+        $attrs = json_decode($node->getAttribute('data-attrs'), true);
+        $candidate = is_array($attrs) ? ($attrs['videoId'] ?? '') : '';
+
+        if (! is_string($candidate) || $candidate === '') {
+            // Strip the prefix only: IDs themselves contain "-", so splitting
+            // "youtube2-noBX7D2-7hA" on the first hyphen would truncate it.
+            $candidate = (string) preg_replace('/^youtube\d*-/', '', $node->getAttribute('id'));
+        }
+
+        // Feed content is attacker-influenced; never interpolate an unvalidated
+        // value into the thumbnail and watch URLs built from it.
+        return preg_match('/^[A-Za-z0-9_-]{6,20}$/', $candidate) ? $candidate : null;
+    }
+
+    /**
+     * Build the linked-thumbnail replacement for a stripped video embed.
+     *
+     * Built as DOM nodes for the same reason build_subscribe_node() is: the URL
+     * is attribute-set verbatim and never run through a regex engine.
+     *
+     * hqdefault, not maxresdefault: maxres exists only for videos uploaded
+     * above 720p, so it 404s often enough to leave those posts with no image.
+     *
+     * @param DOMDocument $doc The document to create the node in.
+     * @param string $video_id A validated YouTube video ID.
+     * @return DOMElement The thumbnail block.
+     */
+    private function build_video_thumbnail_node(DOMDocument $doc, string $video_id): DOMElement
+    {
+        $figure = $doc->createElement('figure');
+        $figure->setAttribute('class', 'substack-video-embed');
+
+        $link = $doc->createElement('a');
+        $link->setAttribute('href', 'https://www.youtube.com/watch?v=' . $video_id);
+        $link->setAttribute('target', '_blank');
+        $link->setAttribute('rel', 'noopener noreferrer');
+
+        $img = $doc->createElement('img');
+        $img->setAttribute('src', 'https://img.youtube.com/vi/' . $video_id . '/hqdefault.jpg');
+        $img->setAttribute('alt', 'Watch the video on YouTube');
+        $img->setAttribute('width', '480');
+        $img->setAttribute('height', '360');
+
+        $link->appendChild($img);
+        $figure->appendChild($link);
+
+        return $figure;
     }
 
     /**
