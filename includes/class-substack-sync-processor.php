@@ -134,7 +134,14 @@ class Substack_Sync_Processor
         $posts_skipped = 0;
         $errors = [];
 
-        if ($return_status && $total_posts === 0) {
+        // Returns on both paths, not only the status one: an empty feed rewrote
+        // no content, so falling through to the repair below would scan
+        // pre-rewrite posts, find nothing, and set its one-time flag for good.
+        if ($total_posts === 0) {
+            if (! $return_status) {
+                return;
+            }
+
             return [
                 'success' => true,
                 'total_posts' => 0,
@@ -336,6 +343,15 @@ class Substack_Sync_Processor
 
         $new_offset = $offset + $batch_size;
         $has_more = $new_offset < $total_posts;
+
+        // Last batch only, and here as well as in run_sync_locked(): this is the
+        // path the admin's Sync Now button drives, so leaving the repair on
+        // run_sync() alone made the button unable to ever trigger it. Gated on
+        // the final batch because the repair matches on content the loop above
+        // has to rewrite first.
+        if (! $has_more) {
+            $this->repair_video_featured_images();
+        }
 
         return [
             'success' => true,
@@ -792,11 +808,16 @@ class Substack_Sync_Processor
     }
 
     /**
-     * The embed's node chain: the iframe, then each YouTube-classed ancestor,
-     * innermost first, stopping before $boundary.
+     * The embed's node chain: the iframe, then each ancestor that wraps the
+     * embed and nothing else, innermost first, stopping before $boundary.
      *
-     * The chain is both where the video ID is written and what has to be
-     * replaced. A bare iframe with no wrapper yields a chain of one.
+     * The chain is what gets replaced, so "wraps nothing else" is the whole
+     * rule. Climbing on a class test instead (Substack's youtube-wrap) is wrong
+     * in both directions: it replaces an ancestor that also held a caption,
+     * dropping it silently, and it stops short of a plain <p> sitting between
+     * the wrapper and the iframe, leaving the wrapper's aspect-ratio box empty
+     * around the thumbnail. It is also the same unstable signal that matching
+     * moved off. A bare iframe with no wrapper yields a chain of one.
      *
      * @param DOMElement $iframe The embed iframe.
      * @param DOMElement $boundary The document wrapper, never crossed.
@@ -805,16 +826,45 @@ class Substack_Sync_Processor
     private function youtube_embed_chain(DOMElement $iframe, DOMElement $boundary): array
     {
         $chain = [$iframe];
+        $node = $iframe;
 
-        for ($parent = $iframe->parentNode; $parent instanceof DOMElement && $parent !== $boundary; $parent = $parent->parentNode) {
-            if (stripos($parent->getAttribute('class'), 'youtube') === false) {
+        for ($parent = $node->parentNode; $parent instanceof DOMElement && $parent !== $boundary; $parent = $parent->parentNode) {
+            if (! $this->wraps_only($parent, $node)) {
                 break;
             }
 
             $chain[] = $parent;
+            $node = $parent;
         }
 
         return $chain;
+    }
+
+    /**
+     * Whether $parent contains $child and nothing else that renders.
+     *
+     * Whitespace and comments do not count: Substack's wrappers are pretty
+     * printed, so a strict child-count test would never climb at all.
+     *
+     * @param DOMElement $parent The candidate wrapper.
+     * @param DOMNode $child The node it must be wrapping.
+     * @return bool True when replacing $parent would lose nothing but $parent.
+     */
+    private function wraps_only(DOMElement $parent, DOMNode $child): bool
+    {
+        foreach ($parent->childNodes as $sibling) {
+            if ($sibling === $child || $sibling instanceof DOMComment) {
+                continue;
+            }
+
+            if ($sibling instanceof DOMText && trim($sibling->wholeText) === '') {
+                continue;
+            }
+
+            return false;
+        }
+
+        return true;
     }
 
     /**
@@ -862,11 +912,13 @@ class Substack_Sync_Processor
                 $candidates[] = $attrs['videoId'];
             }
 
-            $id = $node->getAttribute('id');
-            if ($id !== '') {
-                // Strip the prefix only: IDs themselves contain "-", so splitting
-                // "youtube2-noBX7D2-7hA" on the first hyphen would truncate it.
-                $candidates[] = (string) preg_replace('/^youtube\d*-/', '', $id);
+            // Require the prefix rather than stripping it where present: the
+            // chain now climbs any element that wraps nothing but the embed, so
+            // an unrelated wrapper's id must not be read as a video ID. Strip
+            // the prefix only, since IDs themselves contain "-" and splitting
+            // "youtube2-noBX7D2-7hA" on the first hyphen would truncate it.
+            if (preg_match('/^youtube\d*-(.+)$/', $node->getAttribute('id'), $matches)) {
+                $candidates[] = $matches[1];
             }
         }
 
@@ -1141,7 +1193,19 @@ class Substack_Sync_Processor
             $ext = 'jpg';
         }
 
-        $base = wp_basename((string) wp_parse_url($src, PHP_URL_PATH));
+        $path = (string) wp_parse_url($src, PHP_URL_PATH);
+
+        // Every YouTube frame lives at /vi/<ID>/hqdefault.jpg, so the basename
+        // alone would fill the library with hqdefault-1, hqdefault-2, and so on,
+        // one per video post. Name them by the video they came from.
+        if (
+            strtolower((string) wp_parse_url($src, PHP_URL_HOST)) === 'img.youtube.com'
+            && preg_match('#^/vi/([A-Za-z0-9_-]{11})/#', $path, $matches)
+        ) {
+            return sanitize_file_name('youtube-' . $matches[1] . '.' . $ext);
+        }
+
+        $base = wp_basename($path);
         $name = $base !== '' ? (string) preg_replace('/\.[^.]*$/', '', $base) : '';
         if (trim($name) === '') {
             $name = 'substack-image';
@@ -1404,14 +1468,42 @@ class Substack_Sync_Processor
         }
 
         $repaired = 0;
+        $deferred = 0;
+
         foreach ($rows as $row) {
             $post_id = (int) ($row['post_id'] ?? 0);
             if ($post_id <= 0) {
                 continue;
             }
 
-            $attachment_id = $this->leading_video_attachment_id($post_id);
-            if ($attachment_id <= 0 || get_post_thumbnail_id($post_id) === $attachment_id) {
+            $video_id = $this->leading_video_id($post_id);
+            if ($video_id === null) {
+                continue;
+            }
+
+            // Resolved through the source-URL meta, so the attachment is provably
+            // one this plugin sideloaded rather than anything matching by filename.
+            $attachment_id = $this->find_attachment_by_source($this->youtube_thumbnail_url($video_id));
+            if ($attachment_id <= 0) {
+                // A video post whose frame is not in the library yet. Sideloading
+                // is bounded per run and can fail on a transient network error,
+                // so this is work outstanding, not work absent.
+                $deferred++;
+
+                continue;
+            }
+
+            $current = get_post_thumbnail_id($post_id);
+            if ($current === $attachment_id) {
+                continue;
+            }
+
+            // Never take a featured image away from a human. Ordinary syncs are
+            // gated on ! has_post_thumbnail() for exactly that reason, and this
+            // pass runs without that gate, so it needs its own: the only
+            // thumbnails it may replace are ones the plugin itself chose, which
+            // are the attachments carrying a source URL.
+            if ($current > 0 && ! $this->is_sideloaded_attachment($current)) {
                 continue;
             }
 
@@ -1419,29 +1511,51 @@ class Substack_Sync_Processor
             $repaired++;
         }
 
-        update_option(self::VIDEO_THUMBNAIL_REPAIR_OPTION, true);
+        // Only once the pass has nothing left to do. Flagging while a frame is
+        // still waiting on its sideload would forfeit that post permanently,
+        // and nothing about the outcome is visible to the site owner.
+        if ($deferred === 0) {
+            update_option(self::VIDEO_THUMBNAIL_REPAIR_OPTION, true);
+        }
 
         return $repaired;
     }
 
     /**
-     * The attachment behind a post's leading video thumbnail, or 0.
+     * Whether an attachment is one this plugin sideloaded.
+     *
+     * @param int $attachment_id The attachment ID.
+     * @return bool True when the attachment carries a recorded source URL.
+     */
+    private function is_sideloaded_attachment(int $attachment_id): bool
+    {
+        return (string) get_post_meta($attachment_id, '_substack_sync_source_url', true) !== '';
+    }
+
+    /**
+     * The video ID behind a post's leading image, or null when its first image
+     * is not a video frame.
      *
      * "Leading" is the whole point: this fires only when the video figure holds
      * the post's first image, which is the rule process_post_images() already
      * applies when picking a featured image, so the repair can never promote a
      * video frame past a photo that legitimately comes first.
      *
+     * Deliberately stops at the ID rather than resolving the attachment: the
+     * caller has to tell "this post needs no repair" apart from "this post
+     * needs one and its frame has not landed in the library yet", and a single
+     * 0 return collapses those into each other.
+     *
      * @param int $post_id The WordPress post ID.
-     * @return int The attachment ID, or 0 when there is nothing to repair.
+     * @return string|null The video ID, or null when there is nothing to repair.
      */
-    private function leading_video_attachment_id(int $post_id): int
+    private function leading_video_id(int $post_id): ?string
     {
         $post = get_post($post_id);
         $content = (string) ($post->post_content ?? '');
 
         if (stripos($content, 'substack-video-embed') === false) {
-            return 0;
+            return null;
         }
 
         $doc = new DOMDocument();
@@ -1451,22 +1565,15 @@ class Substack_Sync_Processor
         );
 
         if (! $loaded) {
-            return 0;
+            return null;
         }
 
         $first = $doc->getElementsByTagName('img')->item(0);
         if (! $first instanceof DOMElement) {
-            return 0;
+            return null;
         }
 
-        $video_id = $this->leading_embed_video_id($first);
-        if ($video_id === null) {
-            return 0;
-        }
-
-        // Resolved through the source-URL meta, so the attachment is provably
-        // one this plugin sideloaded rather than anything matching by filename.
-        return $this->find_attachment_by_source($this->youtube_thumbnail_url($video_id));
+        return $this->leading_embed_video_id($first);
     }
 
     /**

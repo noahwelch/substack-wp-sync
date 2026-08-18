@@ -30,8 +30,9 @@ class ReviewFixesTest extends TestCase
             $_wp_removed_filters, $_wp_sideload_calls, $_wp_sideload_fail, $_wp_thumbnails,
             $_wp_post_id_counter, $_wp_posts, $_wp_post_meta, $_wp_site_transients,
             $_wp_deleted_site_transients, $_wp_json_responses, $_wp_missing_attachments,
-            $_wp_get_results_rows, $_wp_download_bytes, $_wp_media_handle_fail;
+            $_wp_get_results_rows, $_wp_download_bytes, $_wp_media_handle_fail, $_wp_feed_items;
 
+        $_wp_feed_items = null;
         $_wp_download_bytes = null;
         $_wp_media_handle_fail = false;
         $_wp_get_results_rows = [];
@@ -488,6 +489,202 @@ class ReviewFixesTest extends TestCase
             (bool) get_option('substack_sync_video_thumbnail_repaired'),
             'A transient DB failure must retry on the next sync, not be skipped forever'
         );
+    }
+
+    public function test_repair_waits_for_a_frame_that_is_not_in_the_library_yet(): void
+    {
+        global $_wp_get_results_rows, $_wp_post_meta, $_wp_thumbnails;
+
+        // Sideloading is bounded per run and can fail on a transient network
+        // error, so a video post can lead with a frame whose attachment does not
+        // exist yet. Flagging the pass done there forfeits that post forever.
+        $post_id = $this->insertVideoLeadingPost();
+        set_post_thumbnail($post_id, 901);
+        $_wp_post_meta[901] = ['_substack_sync_source_url' => 'https://cdn.example.com/later-photo.jpg'];
+        $_wp_get_results_rows = ['SELECT DISTINCT post_id' => [['post_id' => $post_id]]];
+
+        $this->assertSame(0, (new Substack_Sync_Processor())->repair_video_featured_images());
+        $this->assertFalse(
+            (bool) get_option('substack_sync_video_thumbnail_repaired'),
+            'Outstanding work must not be mistaken for absent work'
+        );
+        $this->assertSame(901, $_wp_thumbnails[$post_id]);
+
+        // Once the frame lands, the retry repairs it and only then flags done.
+        $_wp_post_meta[900] = ['_substack_sync_source_url' => 'https://img.youtube.com/vi/KNFJSIj6xfQ/hqdefault.jpg'];
+
+        $this->assertSame(1, (new Substack_Sync_Processor())->repair_video_featured_images());
+        $this->assertSame(900, $_wp_thumbnails[$post_id]);
+        $this->assertTrue((bool) get_option('substack_sync_video_thumbnail_repaired'));
+    }
+
+    public function test_repair_leaves_a_featured_image_a_human_chose(): void
+    {
+        global $_wp_get_results_rows, $_wp_post_meta, $_wp_thumbnails;
+
+        $_wp_post_meta[900] = ['_substack_sync_source_url' => 'https://img.youtube.com/vi/KNFJSIj6xfQ/hqdefault.jpg'];
+
+        // 950 carries no source URL, so nothing this plugin sideloaded put it
+        // there. Ordinary syncs never override a featured image for that reason
+        // (! has_post_thumbnail()) and the repair runs without that gate.
+        $post_id = $this->insertVideoLeadingPost();
+        set_post_thumbnail($post_id, 950);
+        $_wp_get_results_rows = ['SELECT DISTINCT post_id' => [['post_id' => $post_id]]];
+
+        $this->assertSame(0, (new Substack_Sync_Processor())->repair_video_featured_images());
+        $this->assertSame(950, $_wp_thumbnails[$post_id], "An editor's own episode card must survive the repair");
+        $this->assertTrue(
+            (bool) get_option('substack_sync_video_thumbnail_repaired'),
+            'A deliberate skip is not outstanding work: the pass is still done'
+        );
+    }
+
+    public function test_empty_feed_does_not_burn_the_repair_flag_on_the_cron_path(): void
+    {
+        global $_wp_feed_items;
+
+        // The cron calls run_sync() with no status, which used to fall past the
+        // zero-item return, run the repair against pre-rewrite content, find
+        // nothing, and set the one-time flag for good.
+        update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
+        $_wp_feed_items = [];
+
+        (new Substack_Sync_Processor())->run_sync();
+
+        $this->assertFalse(
+            (bool) get_option('substack_sync_video_thumbnail_repaired'),
+            'A feed that rewrote nothing must leave the repair for a later sync'
+        );
+    }
+
+    public function test_final_batch_runs_the_repair(): void
+    {
+        global $_wp_feed_items, $_wp_get_results_rows, $_wp_post_meta, $_wp_thumbnails;
+
+        // The admin's Sync Now button drives run_batch_sync(), not run_sync(),
+        // so a repair wired only into the latter can never be triggered by hand.
+        update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
+        $_wp_post_meta[900] = ['_substack_sync_source_url' => 'https://img.youtube.com/vi/KNFJSIj6xfQ/hqdefault.jpg'];
+
+        $post_id = $this->insertVideoLeadingPost();
+        set_post_thumbnail($post_id, 901);
+        $_wp_post_meta[901] = ['_substack_sync_source_url' => 'https://cdn.example.com/later-photo.jpg'];
+        $_wp_get_results_rows = ['SELECT DISTINCT post_id' => [['post_id' => $post_id]]];
+        $_wp_feed_items = [new Stub_Feed_Item('guid-1')];
+
+        $result = (new Substack_Sync_Processor())->run_batch_sync(1, 0);
+
+        $this->assertFalse($result['has_more'], 'Fixture must be the last batch');
+        $this->assertSame(900, $_wp_thumbnails[$post_id]);
+    }
+
+    public function test_batch_with_more_to_come_defers_the_repair(): void
+    {
+        global $_wp_feed_items, $_wp_get_results_rows, $_wp_post_meta, $_wp_thumbnails;
+
+        // Mid-run the loop has not rewritten the remaining posts yet, so the
+        // repair would flag itself done having seen only part of the archive.
+        update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
+        $_wp_post_meta[900] = ['_substack_sync_source_url' => 'https://img.youtube.com/vi/KNFJSIj6xfQ/hqdefault.jpg'];
+
+        $post_id = $this->insertVideoLeadingPost();
+        set_post_thumbnail($post_id, 901);
+        $_wp_post_meta[901] = ['_substack_sync_source_url' => 'https://cdn.example.com/later-photo.jpg'];
+        $_wp_get_results_rows = ['SELECT DISTINCT post_id' => [['post_id' => $post_id]]];
+        $_wp_feed_items = [new Stub_Feed_Item('guid-1'), new Stub_Feed_Item('guid-2')];
+
+        $result = (new Substack_Sync_Processor())->run_batch_sync(1, 0);
+
+        $this->assertTrue($result['has_more'], 'Fixture must not be the last batch');
+        $this->assertSame(901, $_wp_thumbnails[$post_id]);
+        $this->assertFalse((bool) get_option('substack_sync_video_thumbnail_repaired'));
+    }
+
+    public function test_content_beside_the_embed_survives_the_rewrite(): void
+    {
+        update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
+
+        // The replacement climbs to the outermost element that wraps the embed
+        // and nothing else. Climbing on a "youtube" class instead would take
+        // this whole section, caption included, and say nothing about it.
+        $output = $this->invokeProcessContent(
+            '<div class="youtube-section"><p>Caption above the video</p>'
+            . '<div id="youtube2-KNFJSIj6xfQ" class="youtube-wrap">'
+            . '<iframe src="https://www.youtube-nocookie.com/embed/KNFJSIj6xfQ"></iframe></div>'
+            . '<figcaption>Episode 12</figcaption></div>'
+        );
+
+        $this->assertStringContainsString('Caption above the video', $output);
+        $this->assertStringContainsString('<figcaption>Episode 12</figcaption>', $output);
+        $this->assertStringContainsString('vi/KNFJSIj6xfQ/hqdefault.jpg', $output);
+        $this->assertStringNotContainsString('youtube-wrap', $output);
+        $this->assertStringNotContainsString('<iframe', $output);
+    }
+
+    public function test_wrapper_is_replaced_through_a_plain_paragraph(): void
+    {
+        update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
+
+        // A <p> between wrapper and iframe is still a pure wrapper, so the climb
+        // continues through it. Stopping there would leave the aspect-ratio box
+        // standing empty and nest a <figure> inside a <p>.
+        $output = $this->invokeProcessContent(
+            '<div class="youtube-wrap" style="padding-bottom:56.25%"><p>'
+            . '<iframe src="https://www.youtube-nocookie.com/embed/KNFJSIj6xfQ"></iframe></p></div>'
+        );
+
+        $this->assertStringContainsString('vi/KNFJSIj6xfQ/hqdefault.jpg', $output);
+        $this->assertStringNotContainsString('padding-bottom', $output);
+        $this->assertStringNotContainsString('<p>', $output);
+    }
+
+    public function test_unrelated_wrapper_id_is_not_read_as_a_video_id(): void
+    {
+        update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
+
+        // "abcdefghijk" is 11 characters of the ID charset on an element the
+        // climb now reaches, so the id is only a candidate with the Substack
+        // prefix; the real ID is in the src.
+        $output = $this->invokeProcessContent(
+            '<div id="abcdefghijk"><iframe src="https://www.youtube.com/embed/KNFJSIj6xfQ"></iframe></div>'
+        );
+
+        $this->assertStringContainsString('vi/KNFJSIj6xfQ/hqdefault.jpg', $output);
+        $this->assertStringNotContainsString('abcdefghijk', $output);
+    }
+
+    public function test_youtube_frames_are_named_by_video_id_in_the_media_library(): void
+    {
+        // Every frame URL ends in the same /hqdefault.jpg, so naming from the
+        // basename gives one hqdefault-N.jpg per video post.
+        $processor = new Substack_Sync_Processor();
+        $method = new ReflectionMethod($processor, 'filename_for_sideload');
+
+        $this->assertSame(
+            'youtube-KNFJSIj6xfQ.jpg',
+            $method->invoke($processor, 'https://img.youtube.com/vi/KNFJSIj6xfQ/hqdefault.jpg', '/nonexistent')
+        );
+
+        // Everything else still gets its name from the URL basename.
+        $this->assertSame(
+            'later-photo.jpg',
+            $method->invoke($processor, 'https://cdn.example.com/later-photo.jpg', '/nonexistent')
+        );
+    }
+
+    /**
+     * A post whose content leads with the video figure, as a sync rewrites it:
+     * localized <img> src, watch href carrying the ID verbatim, body photo below.
+     */
+    private function insertVideoLeadingPost(): int
+    {
+        return wp_insert_post([
+            'post_title' => 'Clash episode',
+            'post_content' => '<figure class="substack-video-embed">'
+                . '<a href="https://www.youtube.com/watch?v=KNFJSIj6xfQ">'
+                . '<img src="https://files.example.com/youtube-KNFJSIj6xfQ.jpg"></a>'
+                . '</figure><p>Body</p><img src="https://files.example.com/later-photo.jpg">',
+        ]);
     }
 
     // ---------------------------------------------------------------
