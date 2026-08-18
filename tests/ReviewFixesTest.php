@@ -287,7 +287,8 @@ class ReviewFixesTest extends TestCase
         // "noBX7D2-7hA" contains a hyphen, so a split-on-first-hyphen parse of
         // the element id would truncate it to "noBX7D2" and 404 the thumbnail.
         $output = $this->invokeProcessContent(
-            '<div id="youtube2-noBX7D2-7hA" class="youtube-wrap"><iframe src="https://www.youtube-nocookie.com/embed/noBX7D2-7hA"></iframe></div>'
+            '<div id="youtube2-noBX7D2-7hA" class="youtube-wrap">'
+            . '<iframe src="https://www.youtube-nocookie.com/embed/videoseries?list=PLp9pLaqAQe"></iframe></div>'
         );
 
         $this->assertStringContainsString('vi/noBX7D2-7hA/hqdefault.jpg', $output);
@@ -301,7 +302,8 @@ class ReviewFixesTest extends TestCase
         // No usable id anywhere. Feed values reach the URL builders, so an
         // unvalidated one must yield no node at all rather than a bogus link.
         $output = $this->invokeProcessContent(
-            '<div class="youtube-wrap" data-attrs="not json"><iframe src="https://example.com/e"></iframe></div>'
+            '<div class="youtube-wrap" data-attrs="not json">'
+            . '<iframe src="https://www.youtube-nocookie.com/embed/"></iframe></div>'
         );
 
         $this->assertStringNotContainsString('substack-video-embed', $output);
@@ -313,7 +315,8 @@ class ReviewFixesTest extends TestCase
         update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
 
         $output = $this->invokeProcessContent(
-            '<div class="youtube-wrap" data-attrs=\'{"videoId":"abc/../../evil?x=1"}\'><iframe src="https://example.com/e"></iframe></div>'
+            '<div class="youtube-wrap" data-attrs=\'{"videoId":"abc/../../evil?x=1"}\'>'
+            . '<iframe src="https://www.youtube-nocookie.com/embed/"></iframe></div>'
         );
 
         // The wrapper passes through untouched (data-attrs and all); what must
@@ -337,7 +340,11 @@ class ReviewFixesTest extends TestCase
             . '<p>Body</p><img src="https://cdn.example.com/later-photo.jpg">'
         ));
 
-        $this->assertStringContainsString('img.youtube.com', $content, 'The thumbnail must survive wp_kses_post');
+        // bootstrap.php stubs wp_kses_post() and keeps every attribute on an
+        // allowed tag, so this shows only that no disallowed TAG is emitted.
+        // figure/a/img and their attributes were checked against core's real
+        // $allowedposttags (wp-includes/kses.php) by hand.
+        $this->assertStringContainsString('img.youtube.com', $content, 'No disallowed tag in the replacement');
 
         $post_id = wp_insert_post(['post_title' => 'Video post', 'post_content' => $content, 'post_status' => 'publish']);
         $this->invokeProcessPostImages($post_id, $content);
@@ -352,6 +359,134 @@ class ReviewFixesTest extends TestCase
             'https://img.youtube.com/vi/KNFJSIj6xfQ/hqdefault.jpg',
             $_wp_post_meta[$_wp_thumbnails[$post_id]]['_substack_sync_source_url'] ?? null,
             'The embed leads the post, so the video frame wins the featured slot over the later body photo'
+        );
+    }
+
+    public function test_garbage_data_attrs_falls_through_to_the_element_id(): void
+    {
+        update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
+
+        // A present-but-invalid videoId must not mask a usable element id:
+        // every source is tried and the first that validates wins.
+        $output = $this->invokeProcessContent(
+            '<div id="youtube2-KNFJSIj6xfQ" class="youtube-wrap" data-attrs=\'{"videoId":"abc/../evil"}\'>'
+            . '<iframe src="https://www.youtube-nocookie.com/embed/"></iframe></div>'
+        );
+
+        $this->assertStringContainsString('vi/KNFJSIj6xfQ/hqdefault.jpg', $output);
+        $this->assertStringNotContainsString('evil', $output);
+    }
+
+    public function test_playlist_marker_is_not_treated_as_a_video_id(): void
+    {
+        update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
+
+        // "videoseries" is 11 characters of the ID charset, so a charset-and-
+        // length check alone accepts it and then 404s the thumbnail every sync.
+        $output = $this->invokeProcessContent(
+            '<div id="youtube2-videoseries" class="youtube-wrap">'
+            . '<iframe src="https://www.youtube-nocookie.com/embed/videoseries?list=PLp9pLaqAQe"></iframe></div>'
+        );
+
+        $this->assertStringNotContainsString('substack-video-embed', $output);
+        $this->assertStringNotContainsString('videoseries/hqdefault', $output);
+    }
+
+    public function test_lookalike_embed_host_is_left_alone(): void
+    {
+        update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
+
+        // A str_ends_with($host, 'youtube.com') test would match this one.
+        $output = $this->invokeProcessContent(
+            '<div class="youtube-wrap"><iframe src="https://evilyoutube.com/embed/KNFJSIj6xfQ"></iframe></div>'
+        );
+
+        $this->assertStringNotContainsString('substack-video-embed', $output);
+        $this->assertStringNotContainsString('img.youtube.com', $output);
+    }
+
+    public function test_embed_is_rewritten_without_a_substack_wrapper(): void
+    {
+        update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
+
+        // Keying on the embed host rather than Substack's wrapper class is what
+        // keeps this working when their markup changes: here the ID is only in
+        // the src path, and there is no wrapper div at all.
+        $output = $this->invokeProcessContent(
+            '<p>Intro</p><iframe src="https://www.youtube.com/embed/KNFJSIj6xfQ?rel=0"></iframe>'
+        );
+
+        $this->assertStringContainsString('vi/KNFJSIj6xfQ/hqdefault.jpg', $output);
+        $this->assertStringNotContainsString('<iframe', $output);
+        $this->assertStringContainsString('<p>Intro</p>', $output);
+    }
+
+    // ---------------------------------------------------------------
+    // Featured-image repair: set_post_thumbnail() is gated on
+    // ! has_post_thumbnail(), so video posts imported before the embed
+    // rewrite keep the body photo they wrongly picked. One-time pass.
+    // ---------------------------------------------------------------
+
+    public function test_repair_points_a_previously_imported_video_post_at_its_video_frame(): void
+    {
+        global $_wp_get_results_rows, $_wp_post_meta, $_wp_thumbnails;
+
+        $_wp_post_meta[900] = ['_substack_sync_source_url' => 'https://img.youtube.com/vi/KNFJSIj6xfQ/hqdefault.jpg'];
+        $_wp_post_meta[901] = ['_substack_sync_source_url' => 'https://cdn.example.com/later-photo.jpg'];
+
+        // What a pre-rewrite import left behind: content since re-synced so it
+        // leads with the video figure, featured image still the later photo.
+        $post_id = wp_insert_post([
+            'post_title' => 'Clash episode',
+            'post_content' => '<figure class="substack-video-embed">'
+                . '<a href="https://www.youtube.com/watch?v=KNFJSIj6xfQ"><img src="https://files.example.com/hqdefault.jpg"></a>'
+                . '</figure><p>Body</p><img src="https://files.example.com/later-photo.jpg">',
+        ]);
+        set_post_thumbnail($post_id, 901);
+
+        $_wp_get_results_rows = ['SELECT DISTINCT post_id' => [['post_id' => $post_id]]];
+
+        $processor = new Substack_Sync_Processor();
+
+        $this->assertSame(1, $processor->repair_video_featured_images());
+        $this->assertSame(900, $_wp_thumbnails[$post_id], 'The video frame must replace the body photo');
+        $this->assertTrue((bool) get_option('substack_sync_video_thumbnail_repaired'), 'Repair must set its done flag');
+
+        // Idempotent: a second run is a no-op once the flag is set.
+        $this->assertSame(0, $processor->repair_video_featured_images());
+    }
+
+    public function test_repair_leaves_a_post_whose_body_photo_leads(): void
+    {
+        global $_wp_get_results_rows, $_wp_post_meta, $_wp_thumbnails;
+
+        $_wp_post_meta[900] = ['_substack_sync_source_url' => 'https://img.youtube.com/vi/KNFJSIj6xfQ/hqdefault.jpg'];
+
+        // Photo first, video below: process_post_images() would have chosen the
+        // photo, so the repair must not promote the video frame past it.
+        $post_id = wp_insert_post([
+            'post_title' => 'Photo first',
+            'post_content' => '<img src="https://files.example.com/lede.jpg"><figure class="substack-video-embed">'
+                . '<a href="https://www.youtube.com/watch?v=KNFJSIj6xfQ"><img src="https://files.example.com/hqdefault.jpg"></a></figure>',
+        ]);
+        set_post_thumbnail($post_id, 902);
+
+        $_wp_get_results_rows = ['SELECT DISTINCT post_id' => [['post_id' => $post_id]]];
+
+        $this->assertSame(0, (new Substack_Sync_Processor())->repair_video_featured_images());
+        $this->assertSame(902, $_wp_thumbnails[$post_id], 'A legitimately leading photo keeps the featured slot');
+    }
+
+    public function test_repair_does_not_set_its_flag_on_a_query_error(): void
+    {
+        global $_wp_get_results_rows;
+
+        $_wp_get_results_rows = ['SELECT DISTINCT post_id' => null];
+
+        $this->assertSame(0, (new Substack_Sync_Processor())->repair_video_featured_images());
+        $this->assertFalse(
+            (bool) get_option('substack_sync_video_thumbnail_repaired'),
+            'A transient DB failure must retry on the next sync, not be skipped forever'
         );
     }
 

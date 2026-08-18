@@ -665,6 +665,15 @@ if (! function_exists('set_post_thumbnail')) {
     }
 }
 
+if (! function_exists('get_post_thumbnail_id')) {
+    function get_post_thumbnail_id($post = null): int
+    {
+        global $_wp_thumbnails;
+
+        return (int) ($_wp_thumbnails[(int) (is_object($post) ? $post->ID : $post)] ?? 0);
+    }
+}
+
 if (! function_exists('has_post_thumbnail')) {
     function has_post_thumbnail($post = null): bool
     {
