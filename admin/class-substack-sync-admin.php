@@ -330,6 +330,7 @@ class Substack_Sync_Admin
         $failed_posts = $processor->get_failed_posts();
         $unrepaired_videos = $processor->get_unrepaired_video_posts();
         $unrepaired_video_count = $processor->get_unrepaired_video_count();
+        $video_repair_stopped = $processor->video_repair_has_stopped();
 
         ?>
         <div class="wrap">
@@ -444,22 +445,36 @@ class Substack_Sync_Admin
                 </div>
                 <?php endif; ?>
 
-                <?php if (! empty($unrepaired_videos)): ?>
+                <?php // Gated on the count, not the list: entries drop off the list as people fix
+                      // them, and gating on the list would take the rerun button away while posts
+                      // the report never named were still outstanding. ?>
+                <?php if ($unrepaired_video_count > 0): ?>
                 <div class="unrepaired-videos-section" style="margin-bottom: 30px;">
                     <h3 style="color: #b26a00;">
-                        🎬 Video Featured Images Not Repaired
-                        <?php // The list is capped, so a total is only honest when nothing was left out. ?>
-                        <?php if ($unrepaired_video_count > count($unrepaired_videos)): ?>
-                            (<?php echo count($unrepaired_videos); ?> of <?php echo (int) $unrepaired_video_count; ?>)
-                        <?php else: ?>
-                            (<?php echo count($unrepaired_videos); ?>)
-                        <?php endif; ?>
+                        🎬 Video Featured Images Not Repaired (<?php echo (int) $unrepaired_video_count; ?>)
                     </h3>
                     <p class="description">
-                        The one-time repair stopped after several syncs with these posts still outstanding, which
-                        usually means the video was deleted or the post has aged out of the feed. Set their featured
-                        image by hand, or run the pass again once the posts are back in reach.
+                        <?php // Retry Failed Posts re-arms the pass and leaves this list up, so a standing
+                              // list is not on its own evidence that the pass has stopped. ?>
+                        <?php if ($video_repair_stopped): ?>
+                            The one-time repair stopped after several syncs with these posts still outstanding,
+                            which usually means the video was deleted or the post has aged out of the feed.
+                        <?php else: ?>
+                            The one-time repair is armed again and will look at these posts on the next sync.
+                            They were outstanding when it last stopped.
+                        <?php endif; ?>
+                        A post the feed no longer carries is never rewritten, so no sync will reach it: set its
+                        featured image by hand. Posts you fix drop off this list.
                     </p>
+                    <?php if ($unrepaired_video_count > count($unrepaired_videos)): ?>
+                        <p class="description">
+                            <?php // The stored list is capped, so a shorter list than the total is expected. ?>
+                            Naming <?php echo count($unrepaired_videos); ?> of
+                            <?php echo (int) $unrepaired_video_count; ?>. The rest were past the number the
+                            pass records.
+                        </p>
+                    <?php endif; ?>
+                    <?php if (! empty($unrepaired_videos)): ?>
                     <div class="unrepaired-videos-list" style="background: white; border: 1px solid #ddd; border-radius: 4px; max-height: 300px; overflow-y: auto;">
                         <?php foreach ($unrepaired_videos as $unrepaired_id): ?>
                             <div class="unrepaired-video-item" style="padding: 10px; border-bottom: 1px solid #eee;">
@@ -475,6 +490,7 @@ class Substack_Sync_Admin
                             </div>
                         <?php endforeach; ?>
                     </div>
+                    <?php endif; ?>
                     <button type="button" id="repair-videos-btn" class="button" style="margin-top: 10px;">🎬 Run Video Repair Again</button>
                     <div id="repair-videos-status" style="margin-top: 10px;"></div>
                 </div>
@@ -1067,6 +1083,14 @@ class Substack_Sync_Admin
         $this->handle_ajax_request('Retry', function (Substack_Sync_Processor $processor): void {
             $retried_count = $processor->reset_failed_posts();
 
+            if ($retried_count === null) {
+                wp_send_json_error([
+                    'message' => 'The database rejected the reset. Check the server error log for details.',
+                ]);
+
+                return;
+            }
+
             if ($retried_count === 0) {
                 wp_send_json_success(['message' => 'No failed posts to retry']);
 
@@ -1099,7 +1123,8 @@ class Substack_Sync_Admin
             }
 
             wp_send_json_success([
-                'message' => 'The video featured-image repair will run again on the next sync.',
+                'message' => 'The video featured-image repair will run again on the next sync, and the list of '
+                    . 'posts it could not fix has been cleared.',
             ]);
         });
     }
