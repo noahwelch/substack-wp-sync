@@ -797,6 +797,93 @@ class ReviewFixesTest extends TestCase
         );
     }
 
+    public function test_progress_restarts_the_repair_attempt_clock(): void
+    {
+        global $_wp_get_results_rows, $_wp_post_meta, $_wp_thumbnails;
+
+        // One post the pass can fix and one it never will. Counting every
+        // outstanding sync let the permanent one spend the whole budget, so the
+        // pass gave up on posts it was still working through: the cap has to
+        // measure stalling, not elapsed syncs.
+        $repairable = $this->insertVideoLeadingPost();
+        set_post_thumbnail($repairable, 901);
+        $_wp_post_meta[901] = ['_substack_sync_source_url' => 'https://cdn.example.com/later-photo.jpg'];
+        $_wp_post_meta[900] = ['_substack_sync_source_url' => 'https://img.youtube.com/vi/KNFJSIj6xfQ/maxresdefault.jpg'];
+
+        $stuck = $this->insertUnrewrittenVideoPost();
+        set_post_thumbnail($stuck, 902);
+
+        $_wp_get_results_rows = ['SELECT DISTINCT post_id' => [
+            ['post_id' => $repairable],
+            ['post_id' => $stuck],
+        ]];
+
+        // One sync short of the cap, so counting this one would end the pass.
+        update_option('substack_sync_video_thumbnail_repair_attempts', 4);
+
+        $this->assertSame(1, (new Substack_Sync_Processor())->repair_video_featured_images());
+        $this->assertSame(900, $_wp_thumbnails[$repairable]);
+        $this->assertFalse(
+            (bool) get_option('substack_sync_video_thumbnail_repaired'),
+            'A pass that repaired something this sync is converging and must not be cut off'
+        );
+        $this->assertFalse(
+            get_option('substack_sync_video_thumbnail_repair_attempts'),
+            'Progress restarts the clock, so the cap bounds stalling rather than elapsed syncs'
+        );
+    }
+
+    public function test_the_give_up_report_keeps_an_exact_count_past_the_list_cap(): void
+    {
+        global $_wp_get_results_rows;
+
+        // The list is capped at 50 because it is a worklist for a person, but
+        // rendering that cap as a total would tell the owner their backlog is
+        // smaller than it is.
+        $rows = [];
+        for ($post = 0; $post < 51; $post++) {
+            $post_id = $this->insertUnrewrittenVideoPost();
+            set_post_thumbnail($post_id, 901);
+            $rows[] = ['post_id' => $post_id];
+        }
+        $_wp_get_results_rows = ['SELECT DISTINCT post_id' => $rows];
+
+        $processor = new Substack_Sync_Processor();
+        for ($sync = 1; $sync <= 5; $sync++) {
+            $processor->repair_video_featured_images();
+        }
+
+        $this->assertTrue((bool) get_option('substack_sync_video_thumbnail_repaired'));
+        $this->assertCount(50, $processor->get_unrepaired_video_posts(), 'The named list stays bounded');
+        $this->assertSame(
+            51,
+            $processor->get_unrepaired_video_count(),
+            'The count is exact, or the admin screen understates the backlog'
+        );
+    }
+
+    public function test_retry_reset_keeps_the_give_up_report_it_did_not_ask_about(): void
+    {
+        global $_wp_query_result;
+
+        // Retry Failed Posts lives on another tab and gets pressed about
+        // failures with nothing to do with video. Dropping the report would take
+        // the owner's worklist, and the button offering to rerun the pass, off
+        // the screen for as long as the pass needs to rebuild them.
+        update_option('substack_sync_video_thumbnail_repaired', true);
+        update_option('substack_sync_video_thumbnail_repair_attempts', 5);
+        update_option('substack_sync_video_thumbnail_repair_unrepaired', ['count' => 7, 'ids' => [42, 43]]);
+        $_wp_query_result = 1;
+
+        $processor = new Substack_Sync_Processor();
+        $processor->reset_failed_posts();
+
+        $this->assertFalse(get_option('substack_sync_video_thumbnail_repaired'), 'The pass is re-armed');
+        $this->assertFalse(get_option('substack_sync_video_thumbnail_repair_attempts'));
+        $this->assertSame([42, 43], $processor->get_unrepaired_video_posts(), 'The worklist survives');
+        $this->assertSame(7, $processor->get_unrepaired_video_count());
+    }
+
     public function test_failed_post_list_shows_posts_past_the_retry_ceiling(): void
     {
         global $_wp_get_results_calls, $_wp_get_results_rows;
@@ -808,7 +895,7 @@ class ReviewFixesTest extends TestCase
             ['substack_guid' => 'g1', 'substack_title' => 'Dead', 'retry_count' => 3, 'error_message' => 'boom'],
         ]];
 
-        $failed = (new Substack_Sync_Processor())->get_posts_needing_retry();
+        $failed = (new Substack_Sync_Processor())->get_failed_posts();
 
         $this->assertCount(1, $failed);
         $this->assertSame(3, $failed[0]['retry_count'], 'A row at the ceiling is the one a person is asking about');
@@ -829,7 +916,7 @@ class ReviewFixesTest extends TestCase
         // Nothing filters this query any more, so oldest-first would fill the
         // 200-row window with the permanently exhausted backlog and push out
         // the recent failures somebody is actually diagnosing.
-        (new Substack_Sync_Processor())->get_posts_needing_retry();
+        (new Substack_Sync_Processor())->get_failed_posts();
 
         $this->assertStringContainsString('ORDER BY sync_date DESC', $_wp_get_results_calls[0] ?? '');
     }

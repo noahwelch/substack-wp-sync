@@ -327,8 +327,9 @@ class Substack_Sync_Admin
         require_once SUBSTACK_SYNC_PLUGIN_DIR . 'includes/class-substack-sync-processor.php';
         $processor = new Substack_Sync_Processor();
         $stats = $processor->get_sync_stats();
-        $failed_posts = $processor->get_posts_needing_retry();
+        $failed_posts = $processor->get_failed_posts();
         $unrepaired_videos = $processor->get_unrepaired_video_posts();
+        $unrepaired_video_count = $processor->get_unrepaired_video_count();
 
         ?>
         <div class="wrap">
@@ -445,7 +446,15 @@ class Substack_Sync_Admin
 
                 <?php if (! empty($unrepaired_videos)): ?>
                 <div class="unrepaired-videos-section" style="margin-bottom: 30px;">
-                    <h3 style="color: #b26a00;">🎬 Video Featured Images Not Repaired (<?php echo count($unrepaired_videos); ?>)</h3>
+                    <h3 style="color: #b26a00;">
+                        🎬 Video Featured Images Not Repaired
+                        <?php // The list is capped, so a total is only honest when nothing was left out. ?>
+                        <?php if ($unrepaired_video_count > count($unrepaired_videos)): ?>
+                            (<?php echo count($unrepaired_videos); ?> of <?php echo (int) $unrepaired_video_count; ?>)
+                        <?php else: ?>
+                            (<?php echo count($unrepaired_videos); ?>)
+                        <?php endif; ?>
+                    </h3>
                     <p class="description">
                         The one-time repair stopped after several syncs with these posts still outstanding, which
                         usually means the video was deleted or the post has aged out of the feed. Set their featured
