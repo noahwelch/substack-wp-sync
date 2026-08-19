@@ -28,6 +28,14 @@ class Substack_Sync_Processor
     private const SOURCE_URL_META_KEY = 'substack_source_url';
 
     /**
+     * Private attachment-meta key holding the remote URL an attachment was
+     * sideloaded from. Named close to SOURCE_URL_META_KEY but a different thing
+     * on a different object: that one is a post's Substack permalink, this one
+     * is an attachment's origin, and it is what proves the plugin chose an image.
+     */
+    private const ATTACHMENT_SOURCE_URL_META_KEY = '_substack_sync_source_url';
+
+    /**
      * Option flag marking the one-time source-URL backfill as complete.
      */
     private const SOURCE_URL_BACKFILL_OPTION = 'substack_sync_source_url_backfilled';
@@ -36,6 +44,48 @@ class Substack_Sync_Processor
      * Option flag marking the one-time video featured-image repair as complete.
      */
     private const VIDEO_THUMBNAIL_REPAIR_OPTION = 'substack_sync_video_thumbnail_repaired';
+
+    /**
+     * Consecutive syncs the video featured-image repair has run without
+     * repairing anything. Reset by any progress, absent once the pass finishes.
+     */
+    private const VIDEO_THUMBNAIL_REPAIR_ATTEMPTS_OPTION = 'substack_sync_video_thumbnail_repair_attempts';
+
+    /**
+     * What the repair gave up on: {'count': int, 'ids': list<int>}. A count in a
+     * log file is not something a site owner can act on, so the pass records
+     * which posts it left; the count is kept alongside because the list is
+     * capped and a capped list displayed as a total understates the backlog.
+     */
+    private const VIDEO_THUMBNAIL_REPAIR_UNREPAIRED_OPTION = 'substack_sync_video_thumbnail_repair_unrepaired';
+
+    /**
+     * When the no-progress counter last advanced. The cap is counted in syncs
+     * and Sync Now drives one on demand, so without this an owner clicking it
+     * a few times while diagnosing something spends the whole budget before a
+     * sideload has had any chance to retry.
+     */
+    private const VIDEO_THUMBNAIL_REPAIR_ADVANCED_OPTION = 'substack_sync_video_thumbnail_repair_advanced_at';
+
+    /**
+     * No-progress syncs before the repair stops and logs what it could not
+     * reach. Stalling, not elapsed syncs: a pass still repairing posts is
+     * converging, and one permanently stuck post must not run the clock down on
+     * the posts still arriving behind it. Not every outstanding post can ever
+     * finish, though: a deleted video's frame 404s forever, and a post aged out
+     * of the feed is never rewritten. Counted at most once an hour, so the
+     * shortest this can end a pass is five syncs an hour apart rather than five
+     * clicks of Sync Now. The first advance is not rate limited, so that is four
+     * hours of elapsed time, not five.
+     */
+    private const VIDEO_THUMBNAIL_REPAIR_MAX_ATTEMPTS = 5;
+
+    /**
+     * How many unrepaired post IDs the pass records when it gives up. Enough to
+     * work through by hand; past that the list is a symptom, not a worklist.
+     * The recorded count stays exact regardless.
+     */
+    private const VIDEO_THUMBNAIL_REPAIR_MAX_REPORTED = 50;
 
     /**
      * Plugin settings.
@@ -1135,7 +1185,7 @@ class Substack_Sync_Processor
                 }
 
                 $attachment_id = (int) $result;
-                update_post_meta($attachment_id, '_substack_sync_source_url', $src);
+                update_post_meta($attachment_id, self::ATTACHMENT_SOURCE_URL_META_KEY, $src);
             }
 
             // Serve the local copy: without this rewrite the sideloaded files
@@ -1286,7 +1336,7 @@ class Substack_Sync_Processor
         return (int) $wpdb->get_var(
             $wpdb->prepare(
                 "SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = %s AND meta_value = %s LIMIT 1",
-                '_substack_sync_source_url',
+                self::ATTACHMENT_SOURCE_URL_META_KEY,
                 $src
             )
         );
@@ -1500,9 +1550,21 @@ class Substack_Sync_Processor
      *
      * Only posts still in the feed can be repaired, since the repair matches on
      * content a sync rewrote. A video post that has aged out of the feed keeps
-     * its wrong featured image and needs the thumbnail cleared by hand.
+     * its wrong featured image and needs its featured image set by hand: no sync
+     * reprocesses a post the feed no longer carries, so clearing the thumbnail
+     * only leaves the post without one.
      *
-     * Idempotent and option-flag gated, like backfill_source_urls().
+     * Idempotent and option-flag gated, like backfill_source_urls(), but unlike
+     * that pass this one can find work it is not yet able to finish, so the flag
+     * waits: for a frame that has not been sideloaded yet, and for a post no
+     * sync has rewritten yet. It waits only on posts it could actually repair,
+     * since the report it leaves behind is a worklist for a person. Waiting
+     * forever is its own failure, so the wait ends after
+     * VIDEO_THUMBNAIL_REPAIR_MAX_ATTEMPTS hourly syncs that repaired
+     * nothing. Any repair restarts that count, so a pass still making progress
+     * is never cut off. Giving up records the post IDs it left behind, which the
+     * settings screen reads back: an outcome only an error log knows about is one
+     * the site owner never sees.
      *
      * @return int Number of posts repaired.
      */
@@ -1528,6 +1590,7 @@ class Substack_Sync_Processor
 
         $repaired = 0;
         $deferred = 0;
+        $deferred_ids = [];
 
         foreach ($rows as $row) {
             $post_id = (int) ($row['post_id'] ?? 0);
@@ -1535,8 +1598,28 @@ class Substack_Sync_Processor
                 continue;
             }
 
-            $video_id = $this->leading_video_id($post_id);
+            // Null-safe: a log row outlives the post it names once someone
+            // deletes that post, and reading through null is a warning, not a
+            // value. Empty content is correctly nothing to repair.
+            $post = get_post($post_id);
+            $content = (string) ($post?->post_content ?? '');
+
+            $video_id = $this->leading_video_id($content);
             if ($video_id === null) {
+                // A post no sync has rewritten still carries Substack's
+                // wrapper, emptied by kses, and reading that as "nothing to
+                // repair" is what forfeited such posts. Defer it only if the
+                // pass would actually repair it, which both helpers can answer
+                // without the frame: otherwise the give-up worklist asks a
+                // person to go fix posts the pass skips by design.
+                if (
+                    $this->wrapper_leads_images($content)
+                    && $this->thumbnail_is_replaceable((int) get_post_thumbnail_id($post_id))
+                ) {
+                    $deferred++;
+                    $this->record_deferred($deferred_ids, $post_id);
+                }
+
                 continue;
             }
 
@@ -1548,21 +1631,17 @@ class Substack_Sync_Processor
                 // is bounded per run and can fail on a transient network error,
                 // so this is work outstanding, not work absent.
                 $deferred++;
+                $this->record_deferred($deferred_ids, $post_id);
 
                 continue;
             }
 
-            $current = get_post_thumbnail_id($post_id);
+            $current = (int) get_post_thumbnail_id($post_id);
             if ($current === $attachment_id) {
                 continue;
             }
 
-            // Never take a featured image away from a human. Ordinary syncs are
-            // gated on ! has_post_thumbnail() for exactly that reason, and this
-            // pass runs without that gate, so it needs its own: the only
-            // thumbnails it may replace are ones the plugin itself chose, which
-            // are the attachments carrying a source URL.
-            if ($current > 0 && ! $this->is_sideloaded_attachment($current)) {
+            if (! $this->thumbnail_is_replaceable($current)) {
                 continue;
             }
 
@@ -1571,13 +1650,210 @@ class Substack_Sync_Processor
         }
 
         // Only once the pass has nothing left to do. Flagging while a frame is
-        // still waiting on its sideload would forfeit that post permanently,
-        // and nothing about the outcome is visible to the site owner.
+        // still waiting on its sideload would forfeit that post permanently.
         if ($deferred === 0) {
             update_option(self::VIDEO_THUMBNAIL_REPAIR_OPTION, true);
+            delete_option(self::VIDEO_THUMBNAIL_REPAIR_ATTEMPTS_OPTION);
+            delete_option(self::VIDEO_THUMBNAIL_REPAIR_ADVANCED_OPTION);
+            delete_option(self::VIDEO_THUMBNAIL_REPAIR_UNREPAIRED_OPTION);
+
+            return $repaired;
         }
 
+        // Outstanding is not the same as reachable: a deleted video's frame 404s
+        // on every sync and a post aged out of the feed is never rewritten, so
+        // waiting on either rescans the log table for the life of the site. What
+        // bounds the wait is stalling, not elapsed syncs, because one such post
+        // would otherwise spend the whole budget and forfeit the posts still
+        // arriving behind it, which is what this pass exists to prevent.
+        if ($repaired > 0) {
+            delete_option(self::VIDEO_THUMBNAIL_REPAIR_ATTEMPTS_OPTION);
+            delete_option(self::VIDEO_THUMBNAIL_REPAIR_ADVANCED_OPTION);
+
+            return $repaired;
+        }
+
+        // The budget is spent in syncs and Sync Now drives a sync on demand, so
+        // an owner clicking it a few times while diagnosing something would
+        // otherwise end the pass in a minute. Advance at most hourly: that is
+        // the cron's own cadence, and it is the interval a stalled sideload
+        // needs before retrying is worth anything. A timestamp in the future is
+        // a clock that moved, not a recent advance, so it does not hold the
+        // counter back.
+        $now = time();
+        $advanced_at = (int) get_option(self::VIDEO_THUMBNAIL_REPAIR_ADVANCED_OPTION, 0);
+
+        if ($advanced_at > 0 && $advanced_at <= $now && ($now - $advanced_at) < HOUR_IN_SECONDS) {
+            return $repaired;
+        }
+
+        $attempts = (int) get_option(self::VIDEO_THUMBNAIL_REPAIR_ATTEMPTS_OPTION, 0) + 1;
+
+        if ($attempts < self::VIDEO_THUMBNAIL_REPAIR_MAX_ATTEMPTS) {
+            update_option(self::VIDEO_THUMBNAIL_REPAIR_ATTEMPTS_OPTION, $attempts);
+            update_option(self::VIDEO_THUMBNAIL_REPAIR_ADVANCED_OPTION, $now);
+
+            return $repaired;
+        }
+
+        // Post IDs, not just a count: a count tells the owner something is wrong
+        // and leaves them no way to find it. The same report goes into an option
+        // so the settings screen can name the posts and offer the rerun, since an
+        // error log is not a place a site owner looks. The exact count rides
+        // along because $deferred_ids is capped and a capped list rendered as a
+        // total would tell the owner their backlog is smaller than it is.
+        error_log(sprintf(
+            'Substack Sync: stopping the video featured-image repair after %d syncs with no progress and %d '
+            . 'post(s) unrepaired (post IDs: %s). Set their featured image by hand, or use '
+            . '"Run Video Repair Again" on the plugin settings screen.',
+            $attempts,
+            $deferred,
+            implode(', ', $deferred_ids)
+        ));
+
+        update_option(self::VIDEO_THUMBNAIL_REPAIR_OPTION, true);
+        update_option(self::VIDEO_THUMBNAIL_REPAIR_UNREPAIRED_OPTION, [
+            'count' => $deferred,
+            'ids' => $deferred_ids,
+        ]);
+        delete_option(self::VIDEO_THUMBNAIL_REPAIR_ATTEMPTS_OPTION);
+        delete_option(self::VIDEO_THUMBNAIL_REPAIR_ADVANCED_OPTION);
+
         return $repaired;
+    }
+
+    /**
+     * Add a post to the give-up report, up to the cap.
+     *
+     * Bounded because the report is a worklist for a person. The deferred
+     * *count* stays exact; only the list of IDs is truncated.
+     *
+     * @param list<int> $deferred_ids The report so far, modified in place.
+     * @param int $post_id The post being deferred.
+     */
+    private function record_deferred(array &$deferred_ids, int $post_id): void
+    {
+        if (count($deferred_ids) < self::VIDEO_THUMBNAIL_REPAIR_MAX_REPORTED) {
+            $deferred_ids[] = $post_id;
+        }
+    }
+
+    /**
+     * Post IDs the video repair gave up on, for the admin screen.
+     *
+     * @return list<int> Post IDs, empty when the pass finished or never ran.
+     */
+    public function get_unrepaired_video_posts(): array
+    {
+        return $this->unrepaired_video_report()['ids'];
+    }
+
+    /**
+     * How many posts the video repair gave up on, which is not always how many
+     * it can name: VIDEO_THUMBNAIL_REPAIR_MAX_REPORTED caps the list.
+     *
+     * @return int Posts left unrepaired, 0 when the pass finished or never ran.
+     */
+    public function get_unrepaired_video_count(): int
+    {
+        return $this->unrepaired_video_report()['count'];
+    }
+
+    /**
+     * The stored give-up report, normalized.
+     *
+     * @return array{count: int, ids: list<int>}
+     */
+    private function unrepaired_video_report(): array
+    {
+        $stored = get_option(self::VIDEO_THUMBNAIL_REPAIR_UNREPAIRED_OPTION, []);
+
+        if (! is_array($stored)) {
+            return ['count' => 0, 'ids' => []];
+        }
+
+        $ids = array_values(array_filter(array_map('intval', (array) ($stored['ids'] ?? []))));
+
+        // A count below the list length would render as "3 of 2", so the list is
+        // the floor.
+        $count = max((int) ($stored['count'] ?? 0), count($ids));
+
+        // A snapshot worklist goes stale the moment a person acts on an entry, so
+        // drop the resolved ones: post deleted, or a featured image this pass may
+        // no longer replace, which is what an editor's own choice looks like. The
+        // total comes down with them, or a filtered list against a whole total
+        // renders as "1 of 3" and understates nothing that is left.
+        $outstanding = [];
+        foreach ($ids as $id) {
+            if (get_post($id) === null) {
+                continue;
+            }
+            if (! $this->thumbnail_is_replaceable((int) get_post_thumbnail_id($id))) {
+                continue;
+            }
+
+            $outstanding[] = $id;
+        }
+
+        return [
+            'count' => max($count - (count($ids) - count($outstanding)), count($outstanding)),
+            'ids' => $outstanding,
+        ];
+    }
+
+    /**
+     * Put the video featured-image repair back in play, keeping the report.
+     *
+     * Used where re-arming is a side effect of something else, so the give-up
+     * report and the admin section it feeds have to survive: it is a worklist
+     * for a person, and the pass takes several syncs to rebuild it. The pass
+     * clears it itself once it finishes or gives up again.
+     */
+    private function rearm_video_thumbnail_repair(): void
+    {
+        delete_option(self::VIDEO_THUMBNAIL_REPAIR_OPTION);
+        delete_option(self::VIDEO_THUMBNAIL_REPAIR_ATTEMPTS_OPTION);
+        delete_option(self::VIDEO_THUMBNAIL_REPAIR_ADVANCED_OPTION);
+    }
+
+    /**
+     * Put the video featured-image repair back in play and drop the report.
+     *
+     * The counterpart to the pass giving up. Clearing the flag by hand meant a
+     * database query, which put the recovery path out of reach of the person the
+     * give-up message was addressed to. Drops the report because this is the
+     * path a person takes by clicking the button the report itself offers: they
+     * have read the list, so the stale copy of it is noise.
+     *
+     * @return bool True when this cleared state a stopped pass had left behind.
+     */
+    public function restart_video_thumbnail_repair(): bool
+    {
+        // A standing report counts, not just the flag. reset_failed_posts()
+        // clears the flag on its own and leaves the report up, so a report with
+        // no flag is still a stopped pass's leftovers, and reading the flag
+        // alone let this drop the owner's worklist while answering that nothing
+        // had happened.
+        $had_stopped_state = (bool) get_option(self::VIDEO_THUMBNAIL_REPAIR_OPTION)
+            || $this->unrepaired_video_report()['ids'] !== [];
+
+        $this->rearm_video_thumbnail_repair();
+        delete_option(self::VIDEO_THUMBNAIL_REPAIR_UNREPAIRED_OPTION);
+
+        return $had_stopped_state;
+    }
+
+    /**
+     * Whether the video repair has stopped, as opposed to being armed and due.
+     *
+     * The admin section survives a re-arm on purpose, so it cannot describe the
+     * pass as stopped on the strength of the report alone.
+     *
+     * @return bool True when the pass will not run again without a restart.
+     */
+    public function video_repair_has_stopped(): bool
+    {
+        return (bool) get_option(self::VIDEO_THUMBNAIL_REPAIR_OPTION);
     }
 
     /**
@@ -1588,7 +1864,7 @@ class Substack_Sync_Processor
      */
     private function is_sideloaded_attachment(int $attachment_id): bool
     {
-        return (string) get_post_meta($attachment_id, '_substack_sync_source_url', true) !== '';
+        return (string) get_post_meta($attachment_id, self::ATTACHMENT_SOURCE_URL_META_KEY, true) !== '';
     }
 
     /**
@@ -1605,14 +1881,15 @@ class Substack_Sync_Processor
      * needs one and its frame has not landed in the library yet", and a single
      * 0 return collapses those into each other.
      *
-     * @param int $post_id The WordPress post ID.
+     * Takes content rather than a post ID because the caller has to ask a second
+     * question of the same string (has_unrewritten_video_wrapper()) and must not
+     * pay for a second get_post() to do it.
+     *
+     * @param string $content The post's stored content.
      * @return string|null The video ID, or null when there is nothing to repair.
      */
-    private function leading_video_id(int $post_id): ?string
+    private function leading_video_id(string $content): ?string
     {
-        $post = get_post($post_id);
-        $content = (string) ($post->post_content ?? '');
-
         if (stripos($content, 'substack-video-embed') === false) {
             return null;
         }
@@ -1633,6 +1910,120 @@ class Substack_Sync_Processor
         }
 
         return $this->leading_embed_video_id($first);
+    }
+
+    /**
+     * Where content carries a video embed no sync has rewritten, or null.
+     *
+     * wp_kses_post() ate the <iframe> and left Substack's wrapper standing, so
+     * a legacy video post is an empty div carrying the wrapper class, the
+     * "youtube<n>-<ID>" element id, and the data-attrs JSON. Matching on those
+     * is what the live rewrite deliberately stopped doing, because Substack's
+     * markup changes across editor versions, and a post archive spans however
+     * many versions the site has been importing through. So this does not rest
+     * on any one of them: it asks all three and takes whichever appears first,
+     * because missing a legacy post is what forfeits it and the errors are not
+     * symmetric. Presence is the whole question here, so unlike the ID
+     * extraction on the live path these tests validate nothing.
+     *
+     * An offset rather than a bool because the caller has to know whether the
+     * wrapper leads the post's images, which is one of the two conditions the
+     * repair itself gates on.
+     *
+     * A false positive costs a deferred count, which the attempt cap bounds, and
+     * an entry on the give-up worklist, which asks a person to look at a post
+     * that may be fine. The data-attrs test is the loosest of the three and will
+     * also match a non-YouTube embed carrying a videoId, which is the trade it
+     * is making.
+     *
+     * @param string $content The post's stored content.
+     * @return int|null Offset of the earliest wrapper signal, or null when there
+     *                  is no unrewritten embed.
+     */
+    private function unrewritten_wrapper_offset(string $content): ?int
+    {
+        if (stripos($content, 'substack-video-embed') !== false) {
+            return null;
+        }
+
+        $offsets = [];
+
+        // Anchored on token boundaries inside a class attribute, like the id test
+        // below: "youtube-wrap" is a prefix of any number of unrelated class
+        // names, and a post matched on one can never grow the figure that would
+        // clear it, so it defers until the attempt cap runs out.
+        if (
+            preg_match(
+                '/class=["\'][^"\']*(?<![-\w])youtube-wrap(?![-\w])/i',
+                $content,
+                $class_match,
+                PREG_OFFSET_CAPTURE
+            ) === 1
+        ) {
+            $offsets[] = (int) $class_match[0][1];
+        }
+
+        // Anchored on an attribute boundary so data-id="youtube1-..." on some
+        // unrelated element is not read as the wrapper, and quote-agnostic
+        // because nothing guarantees which one wrote the stored content.
+        if (preg_match('/(?<![-\w])id=["\']youtube\d*-/i', $content, $id_match, PREG_OFFSET_CAPTURE) === 1) {
+            $offsets[] = (int) $id_match[0][1];
+        }
+
+        // kses keeps data-* attributes, so the wrapper's payload survives even
+        // when the class and the id prefix are both from a shape we do not know.
+        if (preg_match('/(?<![-\w])data-attrs=["\'][^"\']*videoId/i', $content, $attrs_match, PREG_OFFSET_CAPTURE) === 1) {
+            $offsets[] = (int) $attrs_match[0][1];
+        }
+
+        return $offsets === [] ? null : min($offsets);
+    }
+
+    /**
+     * Whether an unrewritten wrapper sits ahead of the content's first image.
+     *
+     * The repair only promotes a frame when the video holds the post's first
+     * image, so a legacy post whose embed trails a body photo is one the pass
+     * would skip even once the post is rewritten. Asking here keeps such a post
+     * off the give-up worklist instead of telling its owner to fix a post that
+     * is behaving as designed.
+     *
+     * Offsets on the stored string rather than a DOM walk: kses took the iframe,
+     * so the wrapper has no node the image order could be read from, and for
+     * these two tags source order is document order.
+     *
+     * @param string $content The post's stored content.
+     * @return bool True when an unrewritten wrapper precedes every image.
+     */
+    private function wrapper_leads_images(string $content): bool
+    {
+        $wrapper = $this->unrewritten_wrapper_offset($content);
+        if ($wrapper === null) {
+            return false;
+        }
+
+        $first_image = stripos($content, '<img');
+
+        return $first_image === false || $wrapper < $first_image;
+    }
+
+    /**
+     * Whether the repair may replace a post's current featured image.
+     *
+     * Ordinary syncs are gated on ! has_post_thumbnail() so an image from
+     * outside this plugin survives; the pass runs without that gate, so it needs
+     * its own. The gate is narrower than "never override a person": an
+     * attachment carrying a source URL is one this plugin sideloaded, and an
+     * editor who picked a different Substack body photo out of the library is
+     * indistinguishable from the plugin having set it. Uploads from anywhere
+     * else are safe.
+     *
+     * @param int $current The post's current thumbnail ID, 0 when unset.
+     * @return bool True when nothing a person chose would be lost.
+     */
+    private function thumbnail_is_replaceable(int $current): bool
+    {
+        return $current <= 0 || $this->is_sideloaded_attachment($current);
     }
 
     /**
@@ -1732,52 +2123,89 @@ class Substack_Sync_Processor
     }
 
     /**
-     * Get posts that need retry due to errors.
+     * Get posts that failed to sync.
      *
-     * @param int $max_retries Maximum number of retries allowed.
-     * @return array<array<string, mixed>> Posts that need retry.
+     * Every errored row, including the ones past the retry ceiling. Filtering
+     * those out hid exactly the posts that need a person: a row at
+     * retry_count >= the ceiling is one no sync will pick up again. Named for
+     * failure rather than for retry because that is the point: the rows this
+     * returns are no longer all rows a sync will retry.
+     *
+     * Newest first, because nothing filters the result any more: oldest-first
+     * fills the 200-row window with the permanently exhausted backlog and
+     * pushes out the recent failures somebody is actually diagnosing. The
+     * window bounds the display only; reset_failed_posts() is not bounded.
+     *
+     * @return array<array<string, mixed>> Failed posts.
      */
-    public function get_posts_needing_retry(int $max_retries = 3): array
+    public function get_failed_posts(): array
     {
         global $wpdb;
         $table_name = $wpdb->prefix . 'substack_sync_log';
 
         // Bounded: this feeds an admin display list, and an unbounded result
-        // set over a large error backlog serves no one.
+        // set over a large error backlog serves no one. No prepare(): the
+        // retry_count placeholder was the only one, and prepare() with nothing
+        // to bind is a _doing_it_wrong() notice in current WordPress.
         return $wpdb->get_results(
-            $wpdb->prepare("
+            "
                 SELECT substack_guid, substack_title, retry_count, error_message
                 FROM $table_name
-                WHERE status = 'error' AND retry_count < %d
-                ORDER BY sync_date ASC
+                WHERE status = 'error'
+                ORDER BY sync_date DESC
                 LIMIT 200
-            ", $max_retries),
+            ",
             ARRAY_A
         );
     }
 
     /**
-     * Reset retry state for all retryable failed posts in one query.
+     * Reset retry state for every failed post in one query.
      *
      * Replaces a per-row reset loop: one UPDATE instead of N SELECT+UPDATE
      * round trips, and no unbounded row fetch just to walk it.
      *
-     * @param int $max_retries Maximum retries allowed.
-     * @return int Number of rows reset.
+     * No retry_count bound. should_skip_post() stops retrying at
+     * retry_count >= $max_retries, so a "retry_count < $max_retries" filter here
+     * reset every row that was going to be retried anyway and skipped the only
+     * rows a person clicking Retry Failed Posts can be asking about. Those posts
+     * were reachable by no path at all.
+     *
+     * @return int|null Rows reset, or null when the database rejected the query.
      */
-    public function reset_failed_posts(int $max_retries = 3): int
+    public function reset_failed_posts(): ?int
     {
         global $wpdb;
         $table_name = $wpdb->prefix . 'substack_sync_log';
 
+        // No prepare() here either: the retry_count placeholder was the only
+        // one this query had, and prepare() with nothing to bind is a
+        // _doing_it_wrong() notice in current WordPress.
         $updated = $wpdb->query(
-            $wpdb->prepare(
-                "UPDATE $table_name SET retry_count = 0, status = 'pending' WHERE status = 'error' AND retry_count < %d",
-                $max_retries
-            )
+            "UPDATE $table_name SET retry_count = 0, status = 'pending' WHERE status = 'error'"
         );
 
-        return $updated === false ? 0 : (int) $updated;
+        // null, not 0: $wpdb::query() answers false on error, and collapsing that
+        // into "no rows matched" told an owner their backlog was empty on the one
+        // occasion the query never ran.
+        if ($updated === false) {
+            error_log('Substack Sync: the database rejected the failed-post retry reset');
+
+            return null;
+        }
+
+        // A reset puts posts back in reach of the sync loop, which is the one
+        // thing that lets the repair see a video post it previously counted as
+        // having no video. Let it look again, but re-arm rather than restart:
+        // this button is on another tab and gets pressed about failures with
+        // nothing to do with video, and dropping the give-up report would take
+        // the owner's worklist and the button offering to rerun it off the
+        // screen for as long as the pass needs to rebuild them.
+        if ((int) $updated > 0) {
+            $this->rearm_video_thumbnail_repair();
+        }
+
+        return (int) $updated;
     }
 
     /**

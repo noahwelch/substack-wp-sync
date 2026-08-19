@@ -6,7 +6,7 @@
          failOnRisky="true"
          failOnWarning="true">
     <testsuites>
-        <testsuite name="Security Fixes">
+        <testsuite name="Substack Sync">
             <directory>tests</directory>
         </testsuite>
     </testsuites>
