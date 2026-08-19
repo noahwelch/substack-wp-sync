@@ -650,7 +650,16 @@ if (! function_exists('download_url')) {
         global $_wp_sideload_calls, $_wp_sideload_fail, $_wp_download_bytes;
         $_wp_sideload_calls[] = $url;
 
-        if ($_wp_sideload_fail) {
+        // A scalar fails every download; an array fails only the URLs carrying
+        // one of its substrings, which is what a per-URL 404 (a video with no
+        // maxres frame) needs to be expressible.
+        if (is_array($_wp_sideload_fail)) {
+            foreach ($_wp_sideload_fail as $needle) {
+                if (strpos($url, (string) $needle) !== false) {
+                    return new WP_Error('download_failed', 'stub download failure: ' . $url);
+                }
+            }
+        } elseif ($_wp_sideload_fail) {
             return new WP_Error('download_failed', 'stub download failure');
         }
 

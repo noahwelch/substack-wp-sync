@@ -932,17 +932,61 @@ class Substack_Sync_Processor
      * The poster-frame URL for a video ID.
      *
      * Shared by the rewrite and by repair_video_featured_images(), which has to
-     * recognize a URL this produced earlier; they must not drift apart.
+     * recognize a URL this produced earlier; they must not drift apart. It stays
+     * the identity of the frame even when the bytes come from the fallback: the
+     * source-URL meta records what was asked for, not what answered.
      *
-     * hqdefault, not maxresdefault: maxres exists only for videos uploaded
-     * above 720p, so it 404s often enough to leave those posts with no image.
+     * maxresdefault is 1280x720. hqdefault is 480x360, a 4:3 box, so a 16:9
+     * video comes back letterboxed with roughly a quarter of the image as black
+     * bars, and those bars land in the featured slot. maxres exists only for
+     * videos uploaded above 720p, hence youtube_thumbnail_fallback_url().
      *
      * @param string $video_id A validated YouTube video ID.
      * @return string The thumbnail URL.
      */
     private function youtube_thumbnail_url(string $video_id): string
     {
+        return 'https://img.youtube.com/vi/' . $video_id . '/maxresdefault.jpg';
+    }
+
+    /**
+     * The always-present poster frame for a video ID.
+     *
+     * Only YouTube knows whether a given video has a maxres frame, and it
+     * answers by 404ing, so the fallback is the retry rather than a guess made
+     * up front. hqdefault exists for every video ever uploaded.
+     *
+     * @param string $video_id A validated YouTube video ID.
+     * @return string The fallback thumbnail URL.
+     */
+    private function youtube_thumbnail_fallback_url(string $video_id): string
+    {
         return 'https://img.youtube.com/vi/' . $video_id . '/hqdefault.jpg';
+    }
+
+    /**
+     * The fallback frame URL for a maxres frame URL, or '' when $src is not one.
+     *
+     * Both URLs are built from an ID this class already validated against
+     * ^[A-Za-z0-9_-]{11}$ and a hardcoded host, so the retry target inherits the
+     * is_safe_remote_url() check the caller ran on $src rather than needing its
+     * own: no part of either string comes from the feed unfiltered.
+     *
+     * @param string $src The URL that failed to download.
+     * @return string The fallback URL, or '' when there is none.
+     */
+    private function youtube_thumbnail_fallback_for(string $src): string
+    {
+        if (strtolower((string) wp_parse_url($src, PHP_URL_HOST)) !== 'img.youtube.com') {
+            return '';
+        }
+
+        $path = (string) wp_parse_url($src, PHP_URL_PATH);
+        if (! preg_match('#^/vi/([A-Za-z0-9_-]{11})/maxresdefault\.jpg$#', $path, $matches)) {
+            return '';
+        }
+
+        return $this->youtube_thumbnail_fallback_url($matches[1]);
     }
 
     /**
@@ -965,11 +1009,12 @@ class Substack_Sync_Processor
         $link->setAttribute('target', '_blank');
         $link->setAttribute('rel', 'noopener noreferrer');
 
+        // No width/height: this markup is written before anything is fetched,
+        // and the frame is 1280x720 or, when maxres 404s and the sideload falls
+        // back, 480x360. Asserting either one here would stretch the other.
         $img = $doc->createElement('img');
         $img->setAttribute('src', $this->youtube_thumbnail_url($video_id));
         $img->setAttribute('alt', 'Watch the video on YouTube');
-        $img->setAttribute('width', '480');
-        $img->setAttribute('height', '360');
 
         $link->appendChild($img);
         $figure->appendChild($link);
@@ -1137,10 +1182,24 @@ class Substack_Sync_Processor
     private function sideload_remote_image(string $src, int $post_id)
     {
         $tmp = download_url($src);
+
+        // Retry inside the sideload, not in the caller: a missing maxres frame
+        // is an expected answer from YouTube, not a failure, and the caller
+        // counts every WP_Error against a per-run budget that real body images
+        // depend on. Once only, and only for a frame URL this class built.
+        if (is_wp_error($tmp)) {
+            $fallback = $this->youtube_thumbnail_fallback_for($src);
+            if ($fallback !== '') {
+                $tmp = download_url($fallback);
+            }
+        }
+
         if (is_wp_error($tmp)) {
             return $tmp;
         }
 
+        // Named from $src, not from whatever answered, so a video's frame keeps
+        // one name in the library whichever resolution it came back at.
         $filename = $this->filename_for_sideload($src, (string) $tmp);
         if ($filename === '') {
             @unlink($tmp);
@@ -1195,9 +1254,9 @@ class Substack_Sync_Processor
 
         $path = (string) wp_parse_url($src, PHP_URL_PATH);
 
-        // Every YouTube frame lives at /vi/<ID>/hqdefault.jpg, so the basename
-        // alone would fill the library with hqdefault-1, hqdefault-2, and so on,
-        // one per video post. Name them by the video they came from.
+        // Every YouTube frame lives at /vi/<ID>/<size>.jpg, so the basename alone
+        // would fill the library with maxresdefault-1, maxresdefault-2, and so
+        // on, one per video post. Name them by the video they came from.
         if (
             strtolower((string) wp_parse_url($src, PHP_URL_HOST)) === 'img.youtube.com'
             && preg_match('#^/vi/([A-Za-z0-9_-]{11})/#', $path, $matches)

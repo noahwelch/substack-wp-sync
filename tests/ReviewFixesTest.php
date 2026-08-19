@@ -276,7 +276,7 @@ class ReviewFixesTest extends TestCase
         $this->assertStringNotContainsString('youtube-wrap', $output, 'The stripped-iframe wrapper must not survive');
         $this->assertStringNotContainsString('<iframe', $output);
         $this->assertStringContainsString('substack-video-embed', $output);
-        $this->assertStringContainsString('src="https://img.youtube.com/vi/KNFJSIj6xfQ/hqdefault.jpg"', $output);
+        $this->assertStringContainsString('src="https://img.youtube.com/vi/KNFJSIj6xfQ/maxresdefault.jpg"', $output);
         $this->assertStringContainsString('href="https://www.youtube.com/watch?v=KNFJSIj6xfQ"', $output);
         $this->assertStringContainsString('<h1>Why this episode matters</h1>', $output, 'Body copy after the embed must survive');
     }
@@ -292,7 +292,7 @@ class ReviewFixesTest extends TestCase
             . '<iframe src="https://www.youtube-nocookie.com/embed/videoseries?list=PLp9pLaqAQe"></iframe></div>'
         );
 
-        $this->assertStringContainsString('vi/noBX7D2-7hA/hqdefault.jpg', $output);
+        $this->assertStringContainsString('vi/noBX7D2-7hA/maxresdefault.jpg', $output);
         $this->assertStringContainsString('watch?v=noBX7D2-7hA', $output);
     }
 
@@ -351,13 +351,13 @@ class ReviewFixesTest extends TestCase
         $this->invokeProcessPostImages($post_id, $content);
 
         $this->assertSame(
-            'https://img.youtube.com/vi/KNFJSIj6xfQ/hqdefault.jpg',
+            'https://img.youtube.com/vi/KNFJSIj6xfQ/maxresdefault.jpg',
             $_wp_sideload_calls[0] ?? null,
             'The thumbnail must be sideloaded into the media library like any other image'
         );
         $this->assertArrayHasKey($post_id, $_wp_thumbnails, 'A video post must end up with a featured image');
         $this->assertSame(
-            'https://img.youtube.com/vi/KNFJSIj6xfQ/hqdefault.jpg',
+            'https://img.youtube.com/vi/KNFJSIj6xfQ/maxresdefault.jpg',
             $_wp_post_meta[$_wp_thumbnails[$post_id]]['_substack_sync_source_url'] ?? null,
             'The embed leads the post, so the video frame wins the featured slot over the later body photo'
         );
@@ -374,7 +374,7 @@ class ReviewFixesTest extends TestCase
             . '<iframe src="https://www.youtube-nocookie.com/embed/"></iframe></div>'
         );
 
-        $this->assertStringContainsString('vi/KNFJSIj6xfQ/hqdefault.jpg', $output);
+        $this->assertStringContainsString('vi/KNFJSIj6xfQ/maxresdefault.jpg', $output);
         $this->assertStringNotContainsString('evil', $output);
     }
 
@@ -390,7 +390,7 @@ class ReviewFixesTest extends TestCase
         );
 
         $this->assertStringNotContainsString('substack-video-embed', $output);
-        $this->assertStringNotContainsString('videoseries/hqdefault', $output);
+        $this->assertStringNotContainsString('vi/videoseries/', $output);
     }
 
     public function test_lookalike_embed_host_is_left_alone(): void
@@ -417,7 +417,7 @@ class ReviewFixesTest extends TestCase
             '<p>Intro</p><iframe src="https://www.youtube.com/embed/KNFJSIj6xfQ?rel=0"></iframe>'
         );
 
-        $this->assertStringContainsString('vi/KNFJSIj6xfQ/hqdefault.jpg', $output);
+        $this->assertStringContainsString('vi/KNFJSIj6xfQ/maxresdefault.jpg', $output);
         $this->assertStringNotContainsString('<iframe', $output);
         $this->assertStringContainsString('<p>Intro</p>', $output);
     }
@@ -432,7 +432,7 @@ class ReviewFixesTest extends TestCase
     {
         global $_wp_get_results_rows, $_wp_post_meta, $_wp_thumbnails;
 
-        $_wp_post_meta[900] = ['_substack_sync_source_url' => 'https://img.youtube.com/vi/KNFJSIj6xfQ/hqdefault.jpg'];
+        $_wp_post_meta[900] = ['_substack_sync_source_url' => 'https://img.youtube.com/vi/KNFJSIj6xfQ/maxresdefault.jpg'];
         $_wp_post_meta[901] = ['_substack_sync_source_url' => 'https://cdn.example.com/later-photo.jpg'];
 
         // What a pre-rewrite import left behind: content since re-synced so it
@@ -461,7 +461,7 @@ class ReviewFixesTest extends TestCase
     {
         global $_wp_get_results_rows, $_wp_post_meta, $_wp_thumbnails;
 
-        $_wp_post_meta[900] = ['_substack_sync_source_url' => 'https://img.youtube.com/vi/KNFJSIj6xfQ/hqdefault.jpg'];
+        $_wp_post_meta[900] = ['_substack_sync_source_url' => 'https://img.youtube.com/vi/KNFJSIj6xfQ/maxresdefault.jpg'];
 
         // Photo first, video below: process_post_images() would have chosen the
         // photo, so the repair must not promote the video frame past it.
@@ -511,7 +511,7 @@ class ReviewFixesTest extends TestCase
         $this->assertSame(901, $_wp_thumbnails[$post_id]);
 
         // Once the frame lands, the retry repairs it and only then flags done.
-        $_wp_post_meta[900] = ['_substack_sync_source_url' => 'https://img.youtube.com/vi/KNFJSIj6xfQ/hqdefault.jpg'];
+        $_wp_post_meta[900] = ['_substack_sync_source_url' => 'https://img.youtube.com/vi/KNFJSIj6xfQ/maxresdefault.jpg'];
 
         $this->assertSame(1, (new Substack_Sync_Processor())->repair_video_featured_images());
         $this->assertSame(900, $_wp_thumbnails[$post_id]);
@@ -522,7 +522,7 @@ class ReviewFixesTest extends TestCase
     {
         global $_wp_get_results_rows, $_wp_post_meta, $_wp_thumbnails;
 
-        $_wp_post_meta[900] = ['_substack_sync_source_url' => 'https://img.youtube.com/vi/KNFJSIj6xfQ/hqdefault.jpg'];
+        $_wp_post_meta[900] = ['_substack_sync_source_url' => 'https://img.youtube.com/vi/KNFJSIj6xfQ/maxresdefault.jpg'];
 
         // 950 carries no source URL, so nothing this plugin sideloaded put it
         // there. Ordinary syncs never override a featured image for that reason
@@ -564,7 +564,7 @@ class ReviewFixesTest extends TestCase
         // The admin's Sync Now button drives run_batch_sync(), not run_sync(),
         // so a repair wired only into the latter can never be triggered by hand.
         update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
-        $_wp_post_meta[900] = ['_substack_sync_source_url' => 'https://img.youtube.com/vi/KNFJSIj6xfQ/hqdefault.jpg'];
+        $_wp_post_meta[900] = ['_substack_sync_source_url' => 'https://img.youtube.com/vi/KNFJSIj6xfQ/maxresdefault.jpg'];
 
         $post_id = $this->insertVideoLeadingPost();
         set_post_thumbnail($post_id, 901);
@@ -585,7 +585,7 @@ class ReviewFixesTest extends TestCase
         // Mid-run the loop has not rewritten the remaining posts yet, so the
         // repair would flag itself done having seen only part of the archive.
         update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
-        $_wp_post_meta[900] = ['_substack_sync_source_url' => 'https://img.youtube.com/vi/KNFJSIj6xfQ/hqdefault.jpg'];
+        $_wp_post_meta[900] = ['_substack_sync_source_url' => 'https://img.youtube.com/vi/KNFJSIj6xfQ/maxresdefault.jpg'];
 
         $post_id = $this->insertVideoLeadingPost();
         set_post_thumbnail($post_id, 901);
@@ -616,7 +616,7 @@ class ReviewFixesTest extends TestCase
 
         $this->assertStringContainsString('Caption above the video', $output);
         $this->assertStringContainsString('<figcaption>Episode 12</figcaption>', $output);
-        $this->assertStringContainsString('vi/KNFJSIj6xfQ/hqdefault.jpg', $output);
+        $this->assertStringContainsString('vi/KNFJSIj6xfQ/maxresdefault.jpg', $output);
         $this->assertStringNotContainsString('youtube-wrap', $output);
         $this->assertStringNotContainsString('<iframe', $output);
     }
@@ -633,7 +633,7 @@ class ReviewFixesTest extends TestCase
             . '<iframe src="https://www.youtube-nocookie.com/embed/KNFJSIj6xfQ"></iframe></p></div>'
         );
 
-        $this->assertStringContainsString('vi/KNFJSIj6xfQ/hqdefault.jpg', $output);
+        $this->assertStringContainsString('vi/KNFJSIj6xfQ/maxresdefault.jpg', $output);
         $this->assertStringNotContainsString('padding-bottom', $output);
         $this->assertStringNotContainsString('<p>', $output);
     }
@@ -649,20 +649,20 @@ class ReviewFixesTest extends TestCase
             '<div id="abcdefghijk"><iframe src="https://www.youtube.com/embed/KNFJSIj6xfQ"></iframe></div>'
         );
 
-        $this->assertStringContainsString('vi/KNFJSIj6xfQ/hqdefault.jpg', $output);
+        $this->assertStringContainsString('vi/KNFJSIj6xfQ/maxresdefault.jpg', $output);
         $this->assertStringNotContainsString('abcdefghijk', $output);
     }
 
     public function test_youtube_frames_are_named_by_video_id_in_the_media_library(): void
     {
-        // Every frame URL ends in the same /hqdefault.jpg, so naming from the
-        // basename gives one hqdefault-N.jpg per video post.
+        // Every frame URL ends in the same /maxresdefault.jpg, so naming from
+        // the basename gives one maxresdefault-N.jpg per video post.
         $processor = new Substack_Sync_Processor();
         $method = new ReflectionMethod($processor, 'filename_for_sideload');
 
         $this->assertSame(
             'youtube-KNFJSIj6xfQ.jpg',
-            $method->invoke($processor, 'https://img.youtube.com/vi/KNFJSIj6xfQ/hqdefault.jpg', '/nonexistent')
+            $method->invoke($processor, 'https://img.youtube.com/vi/KNFJSIj6xfQ/maxresdefault.jpg', '/nonexistent')
         );
 
         // Everything else still gets its name from the URL basename.
@@ -670,6 +670,91 @@ class ReviewFixesTest extends TestCase
             'later-photo.jpg',
             $method->invoke($processor, 'https://cdn.example.com/later-photo.jpg', '/nonexistent')
         );
+    }
+
+    public function test_missing_maxres_frame_falls_back_to_hqdefault(): void
+    {
+        global $_wp_sideload_calls, $_wp_sideload_fail, $_wp_thumbnails, $_wp_post_meta;
+
+        // maxres exists only for videos uploaded above 720p; YouTube says so by
+        // 404ing. Without the retry those posts sideload nothing and keep the
+        // body photo the whole rewrite exists to displace.
+        $_wp_sideload_fail = ['maxresdefault.jpg'];
+
+        $content = wp_kses_post($this->invokeProcessContent(
+            '<div id="youtube2-KNFJSIj6xfQ" class="youtube-wrap">'
+            . '<iframe src="https://www.youtube-nocookie.com/embed/KNFJSIj6xfQ"></iframe></div>'
+            . '<p>Body</p><img src="https://cdn.example.com/later-photo.jpg">'
+        ));
+
+        $post_id = wp_insert_post(['post_title' => 'Video post', 'post_content' => $content, 'post_status' => 'publish']);
+        $this->invokeProcessPostImages($post_id, $content);
+
+        $this->assertSame(
+            [
+                'https://img.youtube.com/vi/KNFJSIj6xfQ/maxresdefault.jpg',
+                'https://img.youtube.com/vi/KNFJSIj6xfQ/hqdefault.jpg',
+                'https://cdn.example.com/later-photo.jpg',
+            ],
+            $_wp_sideload_calls,
+            'The 404 must be retried once at hqdefault, and must not consume the failure budget the body photo needs'
+        );
+
+        $this->assertArrayHasKey($post_id, $_wp_thumbnails, 'A video with no maxres frame still gets a featured image');
+        $this->assertSame(
+            'https://img.youtube.com/vi/KNFJSIj6xfQ/maxresdefault.jpg',
+            $_wp_post_meta[$_wp_thumbnails[$post_id]]['_substack_sync_source_url'] ?? null,
+            'The source URL records the frame asked for, so dedupe and the repair lookup still resolve'
+        );
+    }
+
+    public function test_a_failing_body_image_is_not_retried(): void
+    {
+        global $_wp_sideload_calls, $_wp_sideload_fail;
+
+        // The retry is for one expected answer from one host, not a general
+        // second attempt at every download.
+        $_wp_sideload_fail = ['cdn.example.com'];
+        $post_id = wp_insert_post(['post_title' => 'x', 'post_content' => 'p', 'post_status' => 'publish']);
+
+        $this->invokeProcessPostImages($post_id, '<p><img src="https://cdn.example.com/photo.jpg"></p>');
+
+        $this->assertSame(['https://cdn.example.com/photo.jpg'], $_wp_sideload_calls);
+    }
+
+    public function test_only_this_class_own_maxres_frame_urls_get_a_fallback(): void
+    {
+        $processor = new Substack_Sync_Processor();
+        $method = new ReflectionMethod($processor, 'youtube_thumbnail_fallback_for');
+
+        $this->assertSame(
+            'https://img.youtube.com/vi/KNFJSIj6xfQ/hqdefault.jpg',
+            $method->invoke($processor, 'https://img.youtube.com/vi/KNFJSIj6xfQ/maxresdefault.jpg')
+        );
+
+        foreach ([
+            'a lookalike host' => 'https://evilimg.youtube.com/vi/KNFJSIj6xfQ/maxresdefault.jpg',
+            'an unrelated host' => 'https://cdn.example.com/vi/KNFJSIj6xfQ/maxresdefault.jpg',
+            'a frame already at the fallback size' => 'https://img.youtube.com/vi/KNFJSIj6xfQ/hqdefault.jpg',
+            'an ID that is not 11 characters' => 'https://img.youtube.com/vi/short/maxresdefault.jpg',
+            'a path with something appended' => 'https://img.youtube.com/vi/KNFJSIj6xfQ/maxresdefault.jpg/x',
+        ] as $why => $url) {
+            $this->assertSame('', $method->invoke($processor, $url), "No fallback for {$why}");
+        }
+    }
+
+    public function test_the_thumbnail_asserts_no_dimensions_it_cannot_guarantee(): void
+    {
+        // The markup is written before anything is fetched, and the frame is
+        // 1280x720 or, on the fallback, 480x360. Either hardcoded pair stretches
+        // the other.
+        $output = $this->invokeProcessContent(
+            '<div class="youtube-wrap"><iframe src="https://www.youtube-nocookie.com/embed/KNFJSIj6xfQ"></iframe></div>'
+        );
+
+        $this->assertStringContainsString('vi/KNFJSIj6xfQ/maxresdefault.jpg', $output);
+        $this->assertStringNotContainsString('width=', $output);
+        $this->assertStringNotContainsString('height=', $output);
     }
 
     /**
