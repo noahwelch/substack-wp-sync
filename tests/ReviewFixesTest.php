@@ -667,6 +667,52 @@ class ReviewFixesTest extends TestCase
         );
     }
 
+    public function test_repair_does_not_read_an_unrelated_class_substring_as_a_video_wrapper(): void
+    {
+        global $_wp_get_results_rows;
+
+        // "youtube-wrap" is a prefix of any number of unrelated class names, and
+        // an unanchored match on one holds the pass open over a post it can never
+        // rewrite: nothing here will ever grow a substack-video-embed figure, so
+        // the pass can only ever end by spending its whole attempt budget.
+        $post_id = wp_insert_post([
+            'post_title' => 'No video here',
+            'post_content' => '<div class="my-youtube-wrapper">A clip worth watching</div>'
+                . '<p>Body</p>',
+        ]);
+        $_wp_get_results_rows = ['SELECT DISTINCT post_id' => [['post_id' => $post_id]]];
+
+        (new Substack_Sync_Processor())->repair_video_featured_images();
+
+        $this->assertTrue(
+            (bool) get_option('substack_sync_video_thumbnail_repaired'),
+            'A post with no video must not be counted as outstanding work'
+        );
+        $this->assertSame([], (new Substack_Sync_Processor())->get_unrepaired_video_posts());
+    }
+
+    public function test_repair_still_reads_the_wrapper_class_on_its_own(): void
+    {
+        global $_wp_get_results_rows, $_wp_post_meta;
+
+        // Anchoring the class test must not cost the signal itself: this wrapper
+        // carries no id and no data-attrs, so the class is all there is to go on.
+        $post_id = wp_insert_post([
+            'post_title' => 'Clash episode, class only',
+            'post_content' => '<div class="pencraft youtube-wrap"></div>'
+                . '<p>Body</p><img src="https://files.example.com/later-photo.jpg">',
+        ]);
+        set_post_thumbnail($post_id, 901);
+        $_wp_post_meta[901] = ['_substack_sync_source_url' => 'https://cdn.example.com/later-photo.jpg'];
+        $_wp_get_results_rows = ['SELECT DISTINCT post_id' => [['post_id' => $post_id]]];
+
+        $this->assertSame(0, (new Substack_Sync_Processor())->repair_video_featured_images());
+        $this->assertFalse(
+            (bool) get_option('substack_sync_video_thumbnail_repaired'),
+            'A legacy video post whose only surviving signal is the class is still outstanding work'
+        );
+    }
+
     public function test_giving_up_records_which_posts_it_left(): void
     {
         global $_wp_get_results_rows;
@@ -691,7 +737,15 @@ class ReviewFixesTest extends TestCase
     {
         global $_wp_get_results_rows, $_wp_post_meta;
 
-        update_option('substack_sync_video_thumbnail_repair_unrepaired', [42]);
+        // A post the report can actually name. An ID with no post behind it is
+        // dropped by the report's own staleness filter, so seeding one reads as
+        // an empty report before the pass has done anything, and the assertion
+        // below then holds whether or not a finished pass clears the option.
+        $stale = $this->insertDeferrableVideoPost();
+        update_option(
+            'substack_sync_video_thumbnail_repair_unrepaired',
+            ['count' => 1, 'ids' => [$stale]]
+        );
 
         $post_id = $this->insertVideoLeadingPost();
         set_post_thumbnail($post_id, 901);
@@ -713,14 +767,12 @@ class ReviewFixesTest extends TestCase
     {
         update_option('substack_sync_video_thumbnail_repaired', true);
         update_option('substack_sync_video_thumbnail_repair_attempts', 5);
-        update_option('substack_sync_video_thumbnail_repair_unrepaired', [42]);
 
         $processor = new Substack_Sync_Processor();
 
         $this->assertTrue($processor->restart_video_thumbnail_repair(), 'A finished pass was reset');
         $this->assertFalse(get_option('substack_sync_video_thumbnail_repaired'));
         $this->assertFalse(get_option('substack_sync_video_thumbnail_repair_attempts'));
-        $this->assertSame([], $processor->get_unrepaired_video_posts());
 
         $this->assertFalse(
             $processor->restart_video_thumbnail_repair(),
@@ -1363,10 +1415,6 @@ class ReviewFixesTest extends TestCase
     }
 
     /**
-     * A post whose content leads with the video figure, as a sync rewrites it:
-     * localized <img> src, watch href carrying the ID verbatim, body photo below.
-     */
-    /**
      * A video post as an older sync stored it: wp_kses_post() ate the <iframe>
      * and left Substack's wrapper standing, id and data-attrs intact, with the
      * featured image taken from the body photo further down.
@@ -1381,6 +1429,10 @@ class ReviewFixesTest extends TestCase
         ]);
     }
 
+    /**
+     * A post whose content leads with the video figure, as a sync rewrites it:
+     * localized <img> src, watch href carrying the ID verbatim, body photo below.
+     */
     private function insertVideoLeadingPost(): int
     {
         return wp_insert_post([

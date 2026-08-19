@@ -74,8 +74,9 @@ class Substack_Sync_Processor
      * the posts still arriving behind it. Not every outstanding post can ever
      * finish, though: a deleted video's frame 404s forever, and a post aged out
      * of the feed is never rewritten. Counted at most once an hour, so the
-     * shortest this can end a pass is five hours rather than five clicks of
-     * Sync Now.
+     * shortest this can end a pass is five syncs an hour apart rather than five
+     * clicks of Sync Now. The first advance is not rate limited, so that is four
+     * hours of elapsed time, not five.
      */
     private const VIDEO_THUMBNAIL_REPAIR_MAX_ATTEMPTS = 5;
 
@@ -1559,7 +1560,7 @@ class Substack_Sync_Processor
      * sync has rewritten yet. It waits only on posts it could actually repair,
      * since the report it leaves behind is a worklist for a person. Waiting
      * forever is its own failure, so the wait ends after
-     * VIDEO_THUMBNAIL_REPAIR_MAX_ATTEMPTS hours of syncs that repaired
+     * VIDEO_THUMBNAIL_REPAIR_MAX_ATTEMPTS hourly syncs that repaired
      * nothing. Any repair restarts that count, so a pass still making progress
      * is never cut off. Giving up records the post IDs it left behind, which the
      * settings screen reads back: an outcome only an error log knows about is one
@@ -1947,9 +1948,19 @@ class Substack_Sync_Processor
 
         $offsets = [];
 
-        $class = stripos($content, 'youtube-wrap');
-        if ($class !== false) {
-            $offsets[] = $class;
+        // Anchored on token boundaries inside a class attribute, like the id test
+        // below: "youtube-wrap" is a prefix of any number of unrelated class
+        // names, and a post matched on one can never grow the figure that would
+        // clear it, so it defers until the attempt cap runs out.
+        if (
+            preg_match(
+                '/class=["\'][^"\']*(?<![-\w])youtube-wrap(?![-\w])/i',
+                $content,
+                $class_match,
+                PREG_OFFSET_CAPTURE
+            ) === 1
+        ) {
+            $offsets[] = (int) $class_match[0][1];
         }
 
         // Anchored on an attribute boundary so data-id="youtube1-..." on some
