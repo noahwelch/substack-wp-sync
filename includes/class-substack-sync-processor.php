@@ -38,6 +38,19 @@ class Substack_Sync_Processor
     private const VIDEO_THUMBNAIL_REPAIR_OPTION = 'substack_sync_video_thumbnail_repaired';
 
     /**
+     * How many syncs the video featured-image repair has run with work still
+     * outstanding. Absent once the pass finishes.
+     */
+    private const VIDEO_THUMBNAIL_REPAIR_ATTEMPTS_OPTION = 'substack_sync_video_thumbnail_repair_attempts';
+
+    /**
+     * Syncs the repair gets to converge before it stops and logs what it could
+     * not reach. Not every outstanding post can ever finish: a deleted video's
+     * frame 404s forever, and a post aged out of the feed is never rewritten.
+     */
+    private const VIDEO_THUMBNAIL_REPAIR_MAX_ATTEMPTS = 5;
+
+    /**
      * Plugin settings.
      *
      * @var array<string, mixed>
@@ -1502,7 +1515,11 @@ class Substack_Sync_Processor
      * content a sync rewrote. A video post that has aged out of the feed keeps
      * its wrong featured image and needs the thumbnail cleared by hand.
      *
-     * Idempotent and option-flag gated, like backfill_source_urls().
+     * Idempotent and option-flag gated, like backfill_source_urls(), but unlike
+     * that pass this one can find work it is not yet able to finish, so the flag
+     * waits: for a frame that has not been sideloaded yet, and for a post no
+     * sync has rewritten yet. Waiting forever is its own failure, so the wait is
+     * capped at VIDEO_THUMBNAIL_REPAIR_MAX_ATTEMPTS syncs and says so in the log.
      *
      * @return int Number of posts repaired.
      */
@@ -1535,8 +1552,20 @@ class Substack_Sync_Processor
                 continue;
             }
 
-            $video_id = $this->leading_video_id($post_id);
+            $post = get_post($post_id);
+            $content = (string) ($post->post_content ?? '');
+
+            $video_id = $this->leading_video_id($content);
             if ($video_id === null) {
+                // A video post no sync has rewritten yet still carries
+                // Substack's wrapper, emptied by kses. Reading that as "nothing
+                // to repair" is what let a post skipped for max retries, or one
+                // whose item threw mid-loop, be flagged done and forfeited: it
+                // looked identical to a post that never had a video.
+                if ($this->has_unrewritten_video_wrapper($content)) {
+                    $deferred++;
+                }
+
                 continue;
             }
 
@@ -1557,11 +1586,13 @@ class Substack_Sync_Processor
                 continue;
             }
 
-            // Never take a featured image away from a human. Ordinary syncs are
-            // gated on ! has_post_thumbnail() for exactly that reason, and this
-            // pass runs without that gate, so it needs its own: the only
-            // thumbnails it may replace are ones the plugin itself chose, which
-            // are the attachments carrying a source URL.
+            // Ordinary syncs are gated on ! has_post_thumbnail() so an image
+            // from outside this plugin survives; the pass runs without that
+            // gate, so it needs its own. The gate it gets is narrower than
+            // "never override a person": an attachment carrying a source URL is
+            // one this plugin sideloaded, and an editor who picked a different
+            // Substack body photo out of the library is indistinguishable from
+            // the plugin having set it. Uploads from anywhere else are safe.
             if ($current > 0 && ! $this->is_sideloaded_attachment($current)) {
                 continue;
             }
@@ -1571,11 +1602,38 @@ class Substack_Sync_Processor
         }
 
         // Only once the pass has nothing left to do. Flagging while a frame is
-        // still waiting on its sideload would forfeit that post permanently,
-        // and nothing about the outcome is visible to the site owner.
+        // still waiting on its sideload would forfeit that post permanently.
         if ($deferred === 0) {
             update_option(self::VIDEO_THUMBNAIL_REPAIR_OPTION, true);
+            delete_option(self::VIDEO_THUMBNAIL_REPAIR_ATTEMPTS_OPTION);
+
+            return $repaired;
         }
+
+        // Outstanding is not the same as reachable. A deleted video's frame 404s
+        // on every sync, and a post that has aged out of the feed is never
+        // rewritten, so waiting on either means rescanning the log table for the
+        // life of the site with nothing to show for it. Give the pass a bounded
+        // number of syncs, then stop and say what it left behind, since an
+        // unrepaired featured image is otherwise invisible to the site owner.
+        $attempts = (int) get_option(self::VIDEO_THUMBNAIL_REPAIR_ATTEMPTS_OPTION, 0) + 1;
+
+        if ($attempts >= self::VIDEO_THUMBNAIL_REPAIR_MAX_ATTEMPTS) {
+            error_log(sprintf(
+                'Substack Sync: stopping the video featured-image repair after %d syncs with %d post(s) unrepaired. '
+                . 'Set their featured image by hand, or delete the %s option to run the pass again.',
+                $attempts,
+                $deferred,
+                self::VIDEO_THUMBNAIL_REPAIR_OPTION
+            ));
+
+            update_option(self::VIDEO_THUMBNAIL_REPAIR_OPTION, true);
+            delete_option(self::VIDEO_THUMBNAIL_REPAIR_ATTEMPTS_OPTION);
+
+            return $repaired;
+        }
+
+        update_option(self::VIDEO_THUMBNAIL_REPAIR_ATTEMPTS_OPTION, $attempts);
 
         return $repaired;
     }
@@ -1605,14 +1663,15 @@ class Substack_Sync_Processor
      * needs one and its frame has not landed in the library yet", and a single
      * 0 return collapses those into each other.
      *
-     * @param int $post_id The WordPress post ID.
+     * Takes content rather than a post ID because the caller has to ask a second
+     * question of the same string (has_unrewritten_video_wrapper()) and must not
+     * pay for a second get_post() to do it.
+     *
+     * @param string $content The post's stored content.
      * @return string|null The video ID, or null when there is nothing to repair.
      */
-    private function leading_video_id(int $post_id): ?string
+    private function leading_video_id(string $content): ?string
     {
-        $post = get_post($post_id);
-        $content = (string) ($post->post_content ?? '');
-
         if (stripos($content, 'substack-video-embed') === false) {
             return null;
         }
@@ -1633,6 +1692,32 @@ class Substack_Sync_Processor
         }
 
         return $this->leading_embed_video_id($first);
+    }
+
+    /**
+     * Whether content still carries a video embed no sync has rewritten.
+     *
+     * wp_kses_post() ate the <iframe> and left Substack's wrapper standing, so
+     * a legacy video post is an empty div carrying the class and the
+     * "youtube<n>-<ID>" element id. Matching on those is what the live rewrite
+     * deliberately stopped doing, because Substack's markup changes across
+     * editor versions. It is the right signal here for the opposite reason:
+     * this reads content already written at import time, so the only version
+     * that matters is the one that wrote it.
+     *
+     * A false positive costs one deferred count, which the attempt cap bounds.
+     *
+     * @param string $content The post's stored content.
+     * @return bool True when a video embed is present but not yet rewritten.
+     */
+    private function has_unrewritten_video_wrapper(string $content): bool
+    {
+        if (stripos($content, 'substack-video-embed') !== false) {
+            return false;
+        }
+
+        return stripos($content, 'youtube-wrap') !== false
+            || preg_match('/\bid="youtube\d*-/i', $content) === 1;
     }
 
     /**
@@ -1734,10 +1819,13 @@ class Substack_Sync_Processor
     /**
      * Get posts that need retry due to errors.
      *
-     * @param int $max_retries Maximum number of retries allowed.
+     * Every errored row, including the ones past the retry ceiling. Filtering
+     * those out hid exactly the posts that need a person: a row at
+     * retry_count >= the ceiling is one no sync will pick up again.
+     *
      * @return array<array<string, mixed>> Posts that need retry.
      */
-    public function get_posts_needing_retry(int $max_retries = 3): array
+    public function get_posts_needing_retry(): array
     {
         global $wpdb;
         $table_name = $wpdb->prefix . 'substack_sync_log';
@@ -1745,39 +1833,53 @@ class Substack_Sync_Processor
         // Bounded: this feeds an admin display list, and an unbounded result
         // set over a large error backlog serves no one.
         return $wpdb->get_results(
-            $wpdb->prepare("
+            "
                 SELECT substack_guid, substack_title, retry_count, error_message
                 FROM $table_name
-                WHERE status = 'error' AND retry_count < %d
+                WHERE status = 'error'
                 ORDER BY sync_date ASC
                 LIMIT 200
-            ", $max_retries),
+            ",
             ARRAY_A
         );
     }
 
     /**
-     * Reset retry state for all retryable failed posts in one query.
+     * Reset retry state for every failed post in one query.
      *
      * Replaces a per-row reset loop: one UPDATE instead of N SELECT+UPDATE
      * round trips, and no unbounded row fetch just to walk it.
      *
-     * @param int $max_retries Maximum retries allowed.
+     * No retry_count bound. should_skip_post() stops retrying at
+     * retry_count >= $max_retries, so a "retry_count < $max_retries" filter here
+     * reset every row that was going to be retried anyway and skipped the only
+     * rows a person clicking Retry Failed Posts can be asking about. Those posts
+     * were reachable by no path at all.
+     *
      * @return int Number of rows reset.
      */
-    public function reset_failed_posts(int $max_retries = 3): int
+    public function reset_failed_posts(): int
     {
         global $wpdb;
         $table_name = $wpdb->prefix . 'substack_sync_log';
 
         $updated = $wpdb->query(
-            $wpdb->prepare(
-                "UPDATE $table_name SET retry_count = 0, status = 'pending' WHERE status = 'error' AND retry_count < %d",
-                $max_retries
-            )
+            "UPDATE $table_name SET retry_count = 0, status = 'pending' WHERE status = 'error'"
         );
 
-        return $updated === false ? 0 : (int) $updated;
+        if ($updated === false) {
+            return 0;
+        }
+
+        // A reset puts posts back in reach of the sync loop, which is the one
+        // thing that lets the repair see a video post it previously counted as
+        // having no video. Let it look again.
+        if ((int) $updated > 0) {
+            delete_option(self::VIDEO_THUMBNAIL_REPAIR_OPTION);
+            delete_option(self::VIDEO_THUMBNAIL_REPAIR_ATTEMPTS_OPTION);
+        }
+
+        return (int) $updated;
     }
 
     /**

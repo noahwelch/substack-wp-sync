@@ -6,7 +6,7 @@ This is a fork of the original [Substack Sync](https://www.christopherspenn.com/
 
 - **Original author:** Christopher S. Penn (https://www.christopherspenn.com/)
 - **Fork maintainer:** Noah Welch
-- **Version:** 1.3.0
+- **Version:** 1.3.1
 - **License:** Apache-2.0
 
 ## Description
@@ -19,7 +19,7 @@ Substack Sync imports posts from a Substack RSS feed into WordPress and keeps ex
 - **Intelligent Content Management:** Imports new posts and updates existing ones with GUID-based tracking
 - **Image Localization:** Sideloads each post image into the Media Library once (deduped by source URL), rewrites post content to serve the local copies, and sets the first as the featured image
 - **Video Embeds:** Rewrites YouTube embeds into a linked thumbnail before sanitization, so video posts keep an image instead of losing the iframe to `wp_kses_post()`. Embeds are matched on the embed host rather than Substack's wrapper markup. The thumbnail takes the featured slot on the same terms as any other image: first in the post, and only when no featured image is set yet
-- **Video Featured-Image Repair:** Video posts imported before the embed rewrite existed had picked an unrelated body photo as their featured image. A one-time pass re-points them at the video frame on the next sync, only where the video leads the post, and only when the image it replaces is one the plugin set, so a featured image chosen by hand is never touched. Posts that have aged out of the feed are not reachable and need their thumbnail cleared by hand
+- **Video Featured-Image Repair:** Video posts imported before the embed rewrite existed had picked an unrelated body photo as their featured image. A one-time pass re-points them at the video frame on the next sync, only where the video leads the post, and only when the image it replaces is one the plugin sideloaded, so a featured image uploaded from anywhere else survives. Note the limit of that test: an editor who picked a different Substack image out of the media library looks identical to the plugin having set it, and the pass will override that choice. The pass waits while work is still outstanding, then stops after five syncs and logs what it could not repair. A post that has aged out of the feed is never rewritten, so its thumbnail has to be cleared by hand
 - **Batch Processing:** Progressive sync system with detailed progress tracking and real-time status updates
 - **Error Handling and Retry Logic:** Automatic retry system for failed imports (up to 3 attempts) with detailed error logging
 - **Content Processing:** Removes Substack-specific elements and replaces them with customizable subscription links

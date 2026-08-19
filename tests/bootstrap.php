@@ -142,6 +142,21 @@ if (! function_exists('update_option')) {
     }
 }
 
+if (! function_exists('delete_option')) {
+    function delete_option(string $option): bool
+    {
+        global $_wp_options;
+
+        if (! array_key_exists($option, $_wp_options)) {
+            return false;
+        }
+
+        unset($_wp_options[$option]);
+
+        return true;
+    }
+}
+
 // --- WordPress post stubs ---
 
 $_wp_posts = [];
@@ -320,7 +335,13 @@ if (! class_exists('wpdb')) {
 
         public function query(string $query)
         {
-            return 0;
+            // Records the SQL and returns a seedable affected-row count, so a
+            // test can drive the branches that key on "did this change
+            // anything" rather than only asserting on the query text.
+            global $_wp_query_calls, $_wp_query_result;
+            $_wp_query_calls[] = $query;
+
+            return $_wp_query_result ?? 0;
         }
 
         public function delete(string $table, array $where, array $where_format = [])

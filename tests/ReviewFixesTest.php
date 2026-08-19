@@ -30,8 +30,11 @@ class ReviewFixesTest extends TestCase
             $_wp_removed_filters, $_wp_sideload_calls, $_wp_sideload_fail, $_wp_thumbnails,
             $_wp_post_id_counter, $_wp_posts, $_wp_post_meta, $_wp_site_transients,
             $_wp_deleted_site_transients, $_wp_json_responses, $_wp_missing_attachments,
-            $_wp_get_results_rows, $_wp_download_bytes, $_wp_media_handle_fail, $_wp_feed_items;
+            $_wp_get_results_rows, $_wp_download_bytes, $_wp_media_handle_fail, $_wp_feed_items,
+            $_wp_query_calls, $_wp_query_result;
 
+        $_wp_query_calls = [];
+        $_wp_query_result = null;
         $_wp_feed_items = null;
         $_wp_download_bytes = null;
         $_wp_media_handle_fail = false;
@@ -539,6 +542,145 @@ class ReviewFixesTest extends TestCase
         );
     }
 
+    public function test_repair_waits_for_a_post_no_sync_has_rewritten_yet(): void
+    {
+        global $_wp_get_results_rows, $_wp_post_meta, $_wp_thumbnails;
+
+        // The frame is in the library, so nothing is outstanding on the sideload
+        // side. What is outstanding is the post itself: an item skipped for max
+        // retries, or one that threw mid-loop, never had its content rewritten,
+        // and used to be indistinguishable from a post that never had a video.
+        $_wp_post_meta[900] = ['_substack_sync_source_url' => 'https://img.youtube.com/vi/KNFJSIj6xfQ/maxresdefault.jpg'];
+
+        $post_id = $this->insertUnrewrittenVideoPost();
+        set_post_thumbnail($post_id, 901);
+        $_wp_post_meta[901] = ['_substack_sync_source_url' => 'https://cdn.example.com/later-photo.jpg'];
+        $_wp_get_results_rows = ['SELECT DISTINCT post_id' => [['post_id' => $post_id]]];
+
+        $this->assertSame(0, (new Substack_Sync_Processor())->repair_video_featured_images());
+        $this->assertFalse(
+            (bool) get_option('substack_sync_video_thumbnail_repaired'),
+            'A video post the sync loop never reached is outstanding work, not absent work'
+        );
+        $this->assertSame(901, $_wp_thumbnails[$post_id]);
+    }
+
+    public function test_repair_stops_after_a_bounded_number_of_syncs(): void
+    {
+        global $_wp_get_results_rows, $_wp_thumbnails;
+
+        // A deleted video's frame 404s on every sync and a post aged out of the
+        // feed is never rewritten, so "wait until nothing is outstanding" is a
+        // wait that can never end. Five syncs, then stop.
+        $post_id = $this->insertUnrewrittenVideoPost();
+        set_post_thumbnail($post_id, 901);
+        $_wp_get_results_rows = ['SELECT DISTINCT post_id' => [['post_id' => $post_id]]];
+
+        for ($sync = 1; $sync <= 4; $sync++) {
+            (new Substack_Sync_Processor())->repair_video_featured_images();
+            $this->assertFalse(
+                (bool) get_option('substack_sync_video_thumbnail_repaired'),
+                "Sync {$sync} must still be trying"
+            );
+            $this->assertSame($sync, (int) get_option('substack_sync_video_thumbnail_repair_attempts'));
+        }
+
+        (new Substack_Sync_Processor())->repair_video_featured_images();
+
+        $this->assertTrue(
+            (bool) get_option('substack_sync_video_thumbnail_repaired'),
+            'The pass must give up rather than rescan the log table for the life of the site'
+        );
+        $this->assertFalse(
+            get_option('substack_sync_video_thumbnail_repair_attempts'),
+            'The counter is scaffolding for an unfinished pass and must not outlive it'
+        );
+        $this->assertSame(901, $_wp_thumbnails[$post_id], 'Giving up changes nothing about the post');
+    }
+
+    public function test_repair_attempt_counter_does_not_survive_a_completed_pass(): void
+    {
+        global $_wp_get_results_rows, $_wp_post_meta, $_wp_thumbnails;
+
+        $post_id = $this->insertVideoLeadingPost();
+        set_post_thumbnail($post_id, 901);
+        $_wp_post_meta[901] = ['_substack_sync_source_url' => 'https://cdn.example.com/later-photo.jpg'];
+        $_wp_get_results_rows = ['SELECT DISTINCT post_id' => [['post_id' => $post_id]]];
+
+        // Frame not in the library yet: one inconclusive sync, counter at 1.
+        $this->assertSame(0, (new Substack_Sync_Processor())->repair_video_featured_images());
+        $this->assertSame(1, (int) get_option('substack_sync_video_thumbnail_repair_attempts'));
+
+        // It lands, so the next sync finishes the work and the counter goes.
+        $_wp_post_meta[900] = ['_substack_sync_source_url' => 'https://img.youtube.com/vi/KNFJSIj6xfQ/maxresdefault.jpg'];
+
+        $this->assertSame(1, (new Substack_Sync_Processor())->repair_video_featured_images());
+        $this->assertSame(900, $_wp_thumbnails[$post_id]);
+        $this->assertTrue((bool) get_option('substack_sync_video_thumbnail_repaired'));
+        $this->assertFalse(get_option('substack_sync_video_thumbnail_repair_attempts'));
+    }
+
+    public function test_retry_reset_reaches_posts_past_the_retry_ceiling(): void
+    {
+        global $_wp_query_calls, $_wp_query_result;
+
+        // should_skip_post() stops retrying at retry_count >= the ceiling, so a
+        // "retry_count < ceiling" filter here reset the rows that were going to
+        // be retried anyway and skipped the only ones a person can be asking
+        // about. Those posts were reachable by no path at all.
+        $_wp_query_result = 2;
+
+        $this->assertSame(2, (new Substack_Sync_Processor())->reset_failed_posts());
+        $this->assertStringNotContainsString(
+            'retry_count <',
+            $_wp_query_calls[0] ?? '',
+            'The reset must not exclude the rows that need it most'
+        );
+    }
+
+    public function test_retry_reset_lets_the_repair_look_again(): void
+    {
+        global $_wp_query_result;
+
+        // A reset puts posts back in reach of the sync loop, which is the only
+        // thing that turns a post the repair wrote off into one it can fix.
+        update_option('substack_sync_video_thumbnail_repaired', true);
+        update_option('substack_sync_video_thumbnail_repair_attempts', 5);
+        $_wp_query_result = 1;
+
+        (new Substack_Sync_Processor())->reset_failed_posts();
+
+        $this->assertFalse(get_option('substack_sync_video_thumbnail_repaired'));
+        $this->assertFalse(get_option('substack_sync_video_thumbnail_repair_attempts'));
+    }
+
+    public function test_retry_reset_that_changes_nothing_leaves_the_repair_alone(): void
+    {
+        global $_wp_query_result;
+
+        update_option('substack_sync_video_thumbnail_repaired', true);
+        $_wp_query_result = 0;
+
+        (new Substack_Sync_Processor())->reset_failed_posts();
+
+        $this->assertTrue(
+            (bool) get_option('substack_sync_video_thumbnail_repaired'),
+            'A reset with no rows to reset is not a reason to rerun a finished pass'
+        );
+    }
+
+    public function test_failed_post_list_shows_posts_past_the_retry_ceiling(): void
+    {
+        $method = $this->extractPhpMethod(self::$processorSource, 'get_posts_needing_retry');
+
+        $this->assertStringContainsString("status = 'error'", $method);
+        $this->assertStringNotContainsString(
+            'retry_count <',
+            $method,
+            'Hiding the rows no sync will pick up again hides exactly the ones needing a person'
+        );
+    }
+
     public function test_empty_feed_does_not_burn_the_repair_flag_on_the_cron_path(): void
     {
         global $_wp_feed_items;
@@ -761,6 +903,21 @@ class ReviewFixesTest extends TestCase
      * A post whose content leads with the video figure, as a sync rewrites it:
      * localized <img> src, watch href carrying the ID verbatim, body photo below.
      */
+    /**
+     * A video post as an older sync stored it: wp_kses_post() ate the <iframe>
+     * and left Substack's wrapper standing, id and data-attrs intact, with the
+     * featured image taken from the body photo further down.
+     */
+    private function insertUnrewrittenVideoPost(): int
+    {
+        return wp_insert_post([
+            'post_title' => 'Clash episode, pre-rewrite',
+            'post_content' => '<div id="youtube2-KNFJSIj6xfQ" class="youtube-wrap"'
+                . ' data-attrs="{&quot;videoId&quot;:&quot;KNFJSIj6xfQ&quot;}"></div>'
+                . '<p>Body</p><img src="https://files.example.com/later-photo.jpg">',
+        ]);
+    }
+
     private function insertVideoLeadingPost(): int
     {
         return wp_insert_post([
