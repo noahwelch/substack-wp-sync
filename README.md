@@ -19,9 +19,9 @@ Substack Sync imports posts from a Substack RSS feed into WordPress and keeps ex
 - **Intelligent Content Management:** Imports new posts and updates existing ones with GUID-based tracking
 - **Image Localization:** Sideloads each post image into the Media Library once (deduped by source URL), rewrites post content to serve the local copies, and sets the first as the featured image
 - **Video Embeds:** Rewrites YouTube embeds into a linked thumbnail before sanitization, so video posts keep an image instead of losing the iframe to `wp_kses_post()`. Embeds are matched on the embed host rather than Substack's wrapper markup. The thumbnail takes the featured slot on the same terms as any other image: first in the post, and only when no featured image is set yet
-- **Video Featured-Image Repair:** Video posts imported before the embed rewrite existed had picked an unrelated body photo as their featured image. A one-time pass re-points them at the video frame on the next sync, only where the video leads the post, and only when the image it replaces is one the plugin sideloaded, so a featured image uploaded from anywhere else survives. Note the limit of that test: an editor who picked a different Substack image out of the media library looks identical to the plugin having set it, and the pass will override that choice. The pass waits while work is still outstanding, then stops after five syncs and logs what it could not repair. A post that has aged out of the feed is never rewritten, so its thumbnail has to be cleared by hand
+- **Video Featured-Image Repair:** Video posts imported before the embed rewrite existed had picked an unrelated body photo as their featured image. A one-time pass re-points them at the video frame on the next sync, only where the video leads the post, and only when the image it replaces is one the plugin sideloaded, so a featured image uploaded from anywhere else survives. Note the limit of that test: an editor who picked a different Substack image out of the media library looks identical to the plugin having set it, and the pass will override that choice. The pass waits while work is still outstanding, then stops after five syncs and lists the posts it could not repair on the Logs & Statistics tab, with a button to run it again. A post that has aged out of the feed is never rewritten, so its thumbnail has to be cleared by hand
 - **Batch Processing:** Progressive sync system with detailed progress tracking and real-time status updates
-- **Error Handling and Retry Logic:** Automatic retry system for failed imports (up to 3 attempts) with detailed error logging
+- **Error Handling and Retry Logic:** Automatic retry system for failed imports (up to 3 attempts) with detailed error logging. A post that exhausts its attempts stops being retried automatically but stays listed and stays resettable, since those are the ones that need a person
 - **Content Processing:** Removes Substack-specific elements and replaces them with customizable subscription links
 - **Category Mapping:** Keyword-based automatic category assignment
 - **Rollback Functionality:** Remove imported posts (all, failed only, or by date range)
@@ -48,7 +48,7 @@ Navigate to **Settings > Substack Sync** in your WordPress admin to configure:
 #### Sync & Import Tab
 - **Manual Sync:** Trigger immediate synchronization with real-time progress tracking
 - **Batch Processing:** Process posts individually with detailed status for each item
-- **Retry Failed Posts:** Reset and retry posts that encountered errors during sync
+- **Retry Failed Posts:** Reset and retry every post that encountered errors during sync, including those past the retry ceiling. This also re-arms the one-time video featured-image repair, since a reset is what puts those posts back in reach of it
 - **Statistics Dashboard:** Visual overview of total synced, imported, updated, and error counts
 
 #### Manage Posts Tab
@@ -56,7 +56,7 @@ Navigate to **Settings > Substack Sync** in your WordPress admin to configure:
 - **Destructive Action Warnings:** Clear confirmation dialogs for all destructive operations
 
 #### Logs & Statistics Tab
-- **Failed Posts List:** Detailed view of posts with sync errors and retry counts
+- **Failed Posts List:** Detailed view of posts with sync errors and retry counts, newest first, including the ones past the retry ceiling
 - **Activity Log:** Real-time sync activity with color-coded status indicators
 - **Sync Statistics:** Metrics including last sync date and performance data
 

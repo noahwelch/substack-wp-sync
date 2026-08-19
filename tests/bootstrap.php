@@ -317,8 +317,12 @@ if (! class_exists('wpdb')) {
         {
             // Seedable by tests: map a query-substring needle to the rows it
             // should return (or null to simulate a query error), mirroring the
-            // get_var() dedup shim above.
-            global $_wp_get_results_rows;
+            // get_var() dedup shim above. The SQL is recorded like query()'s, so
+            // a test can assert on what a read actually asked the database for
+            // rather than on the method's source text.
+            global $_wp_get_results_rows, $_wp_get_results_calls;
+            $_wp_get_results_calls[] = $query;
+
             foreach ((array) ($_wp_get_results_rows ?? []) as $needle => $rows) {
                 if (str_contains($query, (string) $needle)) {
                     return $rows;

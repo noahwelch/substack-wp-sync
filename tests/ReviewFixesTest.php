@@ -31,8 +31,9 @@ class ReviewFixesTest extends TestCase
             $_wp_post_id_counter, $_wp_posts, $_wp_post_meta, $_wp_site_transients,
             $_wp_deleted_site_transients, $_wp_json_responses, $_wp_missing_attachments,
             $_wp_get_results_rows, $_wp_download_bytes, $_wp_media_handle_fail, $_wp_feed_items,
-            $_wp_query_calls, $_wp_query_result;
+            $_wp_query_calls, $_wp_query_result, $_wp_get_results_calls;
 
+        $_wp_get_results_calls = [];
         $_wp_query_calls = [];
         $_wp_query_result = null;
         $_wp_feed_items = null;
@@ -620,6 +621,116 @@ class ReviewFixesTest extends TestCase
         $this->assertFalse(get_option('substack_sync_video_thumbnail_repair_attempts'));
     }
 
+    public function test_repair_waits_for_a_wrapper_shape_it_does_not_recognize(): void
+    {
+        global $_wp_get_results_rows, $_wp_thumbnails;
+
+        // The class and the id prefix are the two signals that have changed
+        // shape across Substack editor versions, and a post archive spans
+        // however many versions the site imported through. Missing a legacy
+        // post forfeits it, so the payload kses left behind answers too.
+        $post_id = wp_insert_post([
+            'post_title' => 'Clash episode, wrapper from some other editor',
+            'post_content' => '<div class="embed-wrap" data-component-name="Youtube2ToDOM"'
+                . ' data-attrs="{&quot;videoId&quot;:&quot;KNFJSIj6xfQ&quot;}"></div>'
+                . '<p>Body</p><img src="https://files.example.com/later-photo.jpg">',
+        ]);
+        set_post_thumbnail($post_id, 901);
+        $_wp_get_results_rows = ['SELECT DISTINCT post_id' => [['post_id' => $post_id]]];
+
+        $this->assertSame(0, (new Substack_Sync_Processor())->repair_video_featured_images());
+        $this->assertFalse(
+            (bool) get_option('substack_sync_video_thumbnail_repaired'),
+            'A legacy video post is outstanding work whichever editor wrote its wrapper'
+        );
+        $this->assertSame(901, $_wp_thumbnails[$post_id]);
+    }
+
+    public function test_repair_does_not_read_an_unrelated_data_id_as_a_video_wrapper(): void
+    {
+        global $_wp_get_results_rows;
+
+        // "\bid=" also matches the tail of data-id=, so an unrelated element
+        // carrying one would hold the flag open for five syncs over nothing.
+        $post_id = wp_insert_post([
+            'post_title' => 'No video here',
+            'post_content' => '<div data-id="youtube1-KNFJSIj6xfQ">A link roundup</div>'
+                . '<img src="https://files.example.com/photo.jpg">',
+        ]);
+        $_wp_get_results_rows = ['SELECT DISTINCT post_id' => [['post_id' => $post_id]]];
+
+        (new Substack_Sync_Processor())->repair_video_featured_images();
+
+        $this->assertTrue(
+            (bool) get_option('substack_sync_video_thumbnail_repaired'),
+            'A post with no video must not be counted as outstanding work'
+        );
+    }
+
+    public function test_giving_up_records_which_posts_it_left(): void
+    {
+        global $_wp_get_results_rows;
+
+        // A count tells the site owner something is wrong and gives them no way
+        // to find it. The give-up report is what the settings screen reads back.
+        $post_id = $this->insertUnrewrittenVideoPost();
+        set_post_thumbnail($post_id, 901);
+        $_wp_get_results_rows = ['SELECT DISTINCT post_id' => [['post_id' => $post_id]]];
+
+        $processor = new Substack_Sync_Processor();
+        for ($sync = 1; $sync <= 5; $sync++) {
+            $processor->repair_video_featured_images();
+        }
+
+        $this->assertTrue((bool) get_option('substack_sync_video_thumbnail_repaired'));
+        $this->assertSame(
+            [$post_id],
+            $processor->get_unrepaired_video_posts(),
+            'Giving up has to name the posts, or the outcome is invisible to a person'
+        );
+    }
+
+    public function test_a_finished_pass_leaves_no_give_up_report(): void
+    {
+        global $_wp_get_results_rows, $_wp_post_meta;
+
+        update_option('substack_sync_video_thumbnail_repair_unrepaired', [42]);
+
+        $post_id = $this->insertVideoLeadingPost();
+        set_post_thumbnail($post_id, 901);
+        $_wp_post_meta[901] = ['_substack_sync_source_url' => 'https://cdn.example.com/later-photo.jpg'];
+        $_wp_post_meta[900] = ['_substack_sync_source_url' => 'https://img.youtube.com/vi/KNFJSIj6xfQ/maxresdefault.jpg'];
+        $_wp_get_results_rows = ['SELECT DISTINCT post_id' => [['post_id' => $post_id]]];
+
+        $processor = new Substack_Sync_Processor();
+
+        $this->assertSame(1, $processor->repair_video_featured_images());
+        $this->assertSame(
+            [],
+            $processor->get_unrepaired_video_posts(),
+            'A stale report would keep naming posts that are fine now'
+        );
+    }
+
+    public function test_restarting_the_repair_puts_it_back_in_play(): void
+    {
+        update_option('substack_sync_video_thumbnail_repaired', true);
+        update_option('substack_sync_video_thumbnail_repair_attempts', 5);
+        update_option('substack_sync_video_thumbnail_repair_unrepaired', [42]);
+
+        $processor = new Substack_Sync_Processor();
+
+        $this->assertTrue($processor->restart_video_thumbnail_repair(), 'A finished pass was reset');
+        $this->assertFalse(get_option('substack_sync_video_thumbnail_repaired'));
+        $this->assertFalse(get_option('substack_sync_video_thumbnail_repair_attempts'));
+        $this->assertSame([], $processor->get_unrepaired_video_posts());
+
+        $this->assertFalse(
+            $processor->restart_video_thumbnail_repair(),
+            'Nothing was finished, so the button has nothing to report'
+        );
+    }
+
     public function test_retry_reset_reaches_posts_past_the_retry_ceiling(): void
     {
         global $_wp_query_calls, $_wp_query_result;
@@ -631,10 +742,27 @@ class ReviewFixesTest extends TestCase
         $_wp_query_result = 2;
 
         $this->assertSame(2, (new Substack_Sync_Processor())->reset_failed_posts());
+        $this->assertNotEmpty($_wp_query_calls, 'The reset must actually issue its UPDATE');
         $this->assertStringNotContainsString(
-            'retry_count <',
-            $_wp_query_calls[0] ?? '',
+            'retry_count',
+            $this->whereClauseOf($_wp_query_calls[0]),
             'The reset must not exclude the rows that need it most'
+        );
+    }
+
+    public function test_a_reset_the_database_rejects_reports_nothing_reset(): void
+    {
+        global $_wp_query_result;
+
+        // $wpdb::query() answers false on error, which is not 0 rows: reporting
+        // it as a count would tell the admin a reset happened that did not.
+        update_option('substack_sync_video_thumbnail_repaired', true);
+        $_wp_query_result = false;
+
+        $this->assertSame(0, (new Substack_Sync_Processor())->reset_failed_posts());
+        $this->assertTrue(
+            (bool) get_option('substack_sync_video_thumbnail_repaired'),
+            'A failed reset must not re-arm the repair pass'
         );
     }
 
@@ -671,14 +799,39 @@ class ReviewFixesTest extends TestCase
 
     public function test_failed_post_list_shows_posts_past_the_retry_ceiling(): void
     {
-        $method = $this->extractPhpMethod(self::$processorSource, 'get_posts_needing_retry');
+        global $_wp_get_results_calls, $_wp_get_results_rows;
 
-        $this->assertStringContainsString("status = 'error'", $method);
+        // Driven through the harness rather than asserted against the method's
+        // source text: "retry_count<3" with no space reintroduces the bug and
+        // reads nothing like the string a source-text assertion looks for.
+        $_wp_get_results_rows = ['SELECT substack_guid' => [
+            ['substack_guid' => 'g1', 'substack_title' => 'Dead', 'retry_count' => 3, 'error_message' => 'boom'],
+        ]];
+
+        $failed = (new Substack_Sync_Processor())->get_posts_needing_retry();
+
+        $this->assertCount(1, $failed);
+        $this->assertSame(3, $failed[0]['retry_count'], 'A row at the ceiling is the one a person is asking about');
+
+        $sql = $_wp_get_results_calls[0] ?? '';
+        $this->assertStringContainsString("status = 'error'", $sql);
         $this->assertStringNotContainsString(
-            'retry_count <',
-            $method,
+            'retry_count',
+            $this->whereClauseOf($sql),
             'Hiding the rows no sync will pick up again hides exactly the ones needing a person'
         );
+    }
+
+    public function test_failed_post_list_shows_the_newest_failures_first(): void
+    {
+        global $_wp_get_results_calls;
+
+        // Nothing filters this query any more, so oldest-first would fill the
+        // 200-row window with the permanently exhausted backlog and push out
+        // the recent failures somebody is actually diagnosing.
+        (new Substack_Sync_Processor())->get_posts_needing_retry();
+
+        $this->assertStringContainsString('ORDER BY sync_date DESC', $_wp_get_results_calls[0] ?? '');
     }
 
     public function test_empty_feed_does_not_burn_the_repair_flag_on_the_cron_path(): void
@@ -897,6 +1050,17 @@ class ReviewFixesTest extends TestCase
         $this->assertStringContainsString('vi/KNFJSIj6xfQ/maxresdefault.jpg', $output);
         $this->assertStringNotContainsString('width=', $output);
         $this->assertStringNotContainsString('height=', $output);
+    }
+
+    /**
+     * Everything from WHERE onward, so a retry_count assertion reads the filter
+     * rather than the SELECT list or the SET clause that legitimately name it.
+     */
+    private function whereClauseOf(string $sql): string
+    {
+        $where = stripos($sql, 'WHERE');
+
+        return $where === false ? '' : substr($sql, $where);
     }
 
     /**

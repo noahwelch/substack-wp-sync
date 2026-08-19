@@ -32,6 +32,7 @@ function substack_sync_uninstall_current_site(): void
     delete_option('substack_sync_source_url_backfilled');
     delete_option('substack_sync_video_thumbnail_repaired');
     delete_option('substack_sync_video_thumbnail_repair_attempts');
+    delete_option('substack_sync_video_thumbnail_repair_unrepaired');
 
     // Drop the custom database table (identifier is prefix-derived, not user input)
     global $wpdb;
