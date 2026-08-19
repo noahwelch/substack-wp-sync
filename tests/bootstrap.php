@@ -543,9 +543,79 @@ if (! function_exists('delete_site_transient')) {
 
 // --- Feed and media stubs ---
 
+/**
+ * Minimal stand-ins for the SimplePie objects fetch_feed() returns, so tests can
+ * drive the sync loop itself and not only its error path. Only the five accessor
+ * methods the processor actually calls are implemented.
+ */
+if (! class_exists('Stub_Feed_Item')) {
+    class Stub_Feed_Item
+    {
+        public function __construct(
+            private string $id = 'https://example.substack.com/p/stub',
+            private string $title = 'Stub post',
+            private string $content = '<p>Body</p>',
+            private string $permalink = 'https://example.substack.com/p/stub'
+        ) {
+        }
+
+        public function get_id(): string
+        {
+            return $this->id;
+        }
+
+        public function get_title(): string
+        {
+            return $this->title;
+        }
+
+        public function get_content(): string
+        {
+            return $this->content;
+        }
+
+        public function get_permalink(): string
+        {
+            return $this->permalink;
+        }
+
+        public function get_date(string $format): string
+        {
+            return date($format, 1700000000);
+        }
+    }
+}
+
+if (! class_exists('Stub_Feed')) {
+    class Stub_Feed
+    {
+        /** @param list<Stub_Feed_Item> $items */
+        public function __construct(private array $items)
+        {
+        }
+
+        /** @return list<Stub_Feed_Item> */
+        public function get_items(): array
+        {
+            return $this->items;
+        }
+    }
+}
+
+$_wp_feed_items = null;
+
 if (! function_exists('fetch_feed')) {
     function fetch_feed(string $url)
     {
+        global $_wp_feed_items;
+
+        // Tests that need the sync loop to run seed $_wp_feed_items, including
+        // with [] for the empty-feed case; leaving it null keeps the fetch error
+        // every other test expects.
+        if (is_array($_wp_feed_items)) {
+            return new Stub_Feed($_wp_feed_items);
+        }
+
         return new WP_Error('feed_error', 'stub fetch_feed: no network in tests');
     }
 }
@@ -580,7 +650,16 @@ if (! function_exists('download_url')) {
         global $_wp_sideload_calls, $_wp_sideload_fail, $_wp_download_bytes;
         $_wp_sideload_calls[] = $url;
 
-        if ($_wp_sideload_fail) {
+        // A scalar fails every download; an array fails only the URLs carrying
+        // one of its substrings, which is what a per-URL 404 (a video with no
+        // maxres frame) needs to be expressible.
+        if (is_array($_wp_sideload_fail)) {
+            foreach ($_wp_sideload_fail as $needle) {
+                if (strpos($url, (string) $needle) !== false) {
+                    return new WP_Error('download_failed', 'stub download failure: ' . $url);
+                }
+            }
+        } elseif ($_wp_sideload_fail) {
             return new WP_Error('download_failed', 'stub download failure');
         }
 
@@ -662,6 +741,15 @@ if (! function_exists('set_post_thumbnail')) {
         $_wp_thumbnails[(int) (is_object($post) ? $post->ID : $post)] = $attachment_id;
 
         return true;
+    }
+}
+
+if (! function_exists('get_post_thumbnail_id')) {
+    function get_post_thumbnail_id($post = null): int
+    {
+        global $_wp_thumbnails;
+
+        return (int) ($_wp_thumbnails[(int) (is_object($post) ? $post->ID : $post)] ?? 0);
     }
 }
 
