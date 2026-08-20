@@ -2013,8 +2013,8 @@ class Substack_Sync_Processor
      * 0 return collapses those into each other.
      *
      * Takes content rather than a post ID because the caller has to ask a second
-     * question of the same string (has_unrewritten_video_wrapper()) and must not
-     * pay for a second get_post() to do it.
+     * question of the same string (wrapper_leads_images()) and must not pay for
+     * a second get_post() to do it.
      *
      * @param string $content The post's stored content.
      * @return string|null The video ID, or null when there is nothing to repair.

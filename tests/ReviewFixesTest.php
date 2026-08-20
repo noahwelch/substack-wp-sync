@@ -2260,6 +2260,35 @@ class ReviewFixesTest extends TestCase
     }
 
     // ---------------------------------------------------------------
+    // Uninstall coverage: every option the processor owns has to be
+    // named in uninstall.php, or opting into data deletion leaves rows
+    // behind. Driven off the constants so a new option fails this too.
+    // ---------------------------------------------------------------
+
+    public function test_uninstall_deletes_every_option_the_processor_owns(): void
+    {
+        $uninstall = file_get_contents(SUBSTACK_SYNC_PLUGIN_DIR . 'uninstall.php');
+        $constants = (new ReflectionClass(Substack_Sync_Processor::class))->getConstants();
+
+        $owned = [];
+        foreach ($constants as $name => $value) {
+            if (str_ends_with($name, '_OPTION')) {
+                $owned[$name] = $value;
+            }
+        }
+
+        $this->assertNotEmpty($owned, 'The processor must declare its option names as constants');
+
+        foreach ($owned as $name => $option) {
+            $this->assertStringContainsString(
+                "delete_option('{$option}')",
+                $uninstall,
+                "uninstall.php must delete {$name} ({$option})"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
     // Helpers
     // ---------------------------------------------------------------
 
