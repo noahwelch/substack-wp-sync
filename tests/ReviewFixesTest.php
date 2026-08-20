@@ -257,10 +257,12 @@ class ReviewFixesTest extends TestCase
     }
 
     // ---------------------------------------------------------------
-    // YouTube embeds: Substack ships them as an <iframe>, which
-    // wp_kses_post() strips, so video posts arrived with an empty
-    // wrapper div and no image. They are rewritten to a linked
-    // thumbnail before sanitization.
+    // YouTube embeds: Substack ships them as an <iframe> in a wrapper
+    // div, and wp_kses_post() strips the iframe, so video posts
+    // arrived as an empty wrapper with no image. They are rewritten to
+    // a linked thumbnail, matched on the embed host where an iframe is
+    // still present and on the wrapper where it is not. On an imported
+    // post it never is: fetch_feed() sanitizes while parsing.
     // ---------------------------------------------------------------
 
     public function test_process_content_replaces_youtube_embed_with_linked_thumbnail(): void
@@ -424,6 +426,110 @@ class ReviewFixesTest extends TestCase
         $this->assertStringContainsString('vi/KNFJSIj6xfQ/maxresdefault.jpg', $output);
         $this->assertStringNotContainsString('<iframe', $output);
         $this->assertStringContainsString('<p>Intro</p>', $output);
+    }
+
+    public function test_wrapper_alone_is_rewritten_once_the_iframe_is_gone(): void
+    {
+        update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
+
+        // What get_content() actually returns for a video post: fetch_feed()
+        // sanitizes content:encoded with WP_SimplePie_Sanitize_KSES while
+        // parsing, so the iframe is already gone and only the wrapper arrives.
+        $output = $this->invokeProcessContent(
+            '<div id="youtube2-noBX7D2-7hA" class="youtube-wrap"'
+            . ' data-attrs="{&quot;videoId&quot;:&quot;noBX7D2-7hA&quot;,&quot;startTime&quot;:null}"'
+            . ' data-component-name="Youtube2ToDOM"><div class="youtube-inner"></div></div>'
+            . '<h1>The Episode Concept</h1>'
+        );
+
+        $this->assertStringNotContainsString('youtube-wrap', $output, 'The emptied wrapper must not survive');
+        $this->assertStringNotContainsString('youtube-inner', $output);
+        $this->assertStringContainsString('substack-video-embed', $output);
+        $this->assertStringContainsString('src="https://img.youtube.com/vi/noBX7D2-7hA/maxresdefault.jpg"', $output);
+        $this->assertStringContainsString('href="https://www.youtube.com/watch?v=noBX7D2-7hA"', $output);
+        $this->assertStringContainsString('<h1>The Episode Concept</h1>', $output, 'Body copy after the embed must survive');
+    }
+
+    public function test_wrapper_alone_is_rewritten_from_the_element_id(): void
+    {
+        update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
+
+        // No iframe and no data-attrs: with the embed stripped, the element id
+        // is the only record of the video left in the content.
+        $output = $this->invokeProcessContent('<div id="youtube2-KNFJSIj6xfQ" class="youtube-wrap"></div>');
+
+        $this->assertStringContainsString('vi/KNFJSIj6xfQ/maxresdefault.jpg', $output);
+        $this->assertStringContainsString('watch?v=KNFJSIj6xfQ', $output);
+    }
+
+    public function test_non_youtube_wrapper_carrying_a_video_id_is_left_alone(): void
+    {
+        update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
+
+        // Substack writes data-attrs videoId for other embed types too, and
+        // their IDs are not YouTube IDs, so nothing here names YouTube and
+        // nothing may be rewritten. The word in the prose is what gets the
+        // content past the cheap pre-check.
+        $output = $this->invokeProcessContent(
+            '<p>Not a youtube post.</p>'
+            . '<div class="native-video-embed" data-attrs=\'{"videoId":"abcdefghijk"}\''
+            . ' data-component-name="NativeVideoToDOM"></div>'
+        );
+
+        $this->assertStringNotContainsString('substack-video-embed', $output);
+        $this->assertStringNotContainsString('img.youtube.com', $output);
+        $this->assertStringContainsString('native-video-embed', $output, 'The other embed must pass through untouched');
+    }
+
+    public function test_wrapper_around_a_surviving_foreign_iframe_is_left_alone(): void
+    {
+        update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
+
+        // An iframe still standing is a live player. Replacing it on the
+        // strength of a videoId that YouTube never issued would trade a working
+        // embed for a 404 frame and a dead link.
+        $output = $this->invokeProcessContent(
+            '<div class="youtube-wrap" data-attrs=\'{"videoId":"abcdefghijk"}\'>'
+            . '<iframe src="https://player.vimeo.com/video/12345"></iframe></div>'
+        );
+
+        $this->assertStringNotContainsString('substack-video-embed', $output);
+        $this->assertStringContainsString('player.vimeo.com', $output);
+    }
+
+    public function test_the_content_fetch_feed_delivers_wins_the_featured_slot(): void
+    {
+        global $_wp_sideload_calls, $_wp_thumbnails, $_wp_post_meta;
+
+        update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
+
+        // The whole production order, which is what an iframe-only match missed:
+        // sanitize on the way in (fetch_feed), then process_content(), then
+        // sanitize again (prepare_post_data), then localize images.
+        $delivered = wp_kses_post(
+            '<div id="youtube2-KNFJSIj6xfQ" class="youtube-wrap" data-attrs="{&quot;videoId&quot;:&quot;KNFJSIj6xfQ&quot;}"'
+            . ' data-component-name="Youtube2ToDOM"><div class="youtube-inner">'
+            . '<iframe src="https://www.youtube-nocookie.com/embed/KNFJSIj6xfQ"></iframe></div></div>'
+            . '<p>Body</p><img src="https://cdn.example.com/later-photo.jpg">'
+        );
+
+        $this->assertStringNotContainsString('<iframe', $delivered, 'Sanitization on the way in eats the iframe');
+
+        $content = wp_kses_post($this->invokeProcessContent($delivered));
+        $post_id = wp_insert_post(['post_title' => 'Video post', 'post_content' => $content, 'post_status' => 'publish']);
+        $this->invokeProcessPostImages($post_id, $content);
+
+        $this->assertSame(
+            'https://img.youtube.com/vi/KNFJSIj6xfQ/maxresdefault.jpg',
+            $_wp_sideload_calls[0] ?? null,
+            'The frame must be sideloaded from the wrapper the feed actually delivers'
+        );
+        $this->assertArrayHasKey($post_id, $_wp_thumbnails, 'A video post must end up with a featured image');
+        $this->assertSame(
+            'https://img.youtube.com/vi/KNFJSIj6xfQ/maxresdefault.jpg',
+            $_wp_post_meta[$_wp_thumbnails[$post_id]]['_substack_sync_source_url'] ?? null,
+            'The embed leads the post, so the video frame wins the featured slot over the later body photo'
+        );
     }
 
     // ---------------------------------------------------------------

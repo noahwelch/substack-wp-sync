@@ -749,10 +749,18 @@ class Substack_Sync_Processor
             }
         }
 
-        // Substack embeds video as an <iframe>, which wp_kses_post() strips
-        // (iframe is not an allowed post tag), leaving an empty wrapper div and
-        // no image at all. Swap in a linked thumbnail: it survives kses and is
-        // sideloaded by process_post_images() like any other image.
+        // Substack embeds video as an <iframe> inside a wrapper div, and the
+        // iframe never reaches WordPress: it is not an allowed post tag, so kses
+        // strips it and leaves the empty wrapper with no image at all. Swap in a
+        // linked thumbnail, which survives kses and is sideloaded by
+        // process_post_images() like any other image.
+        //
+        // Two passes, because on an imported post the strip already happened:
+        // fetch_feed() sanitizes with WP_SimplePie_Sanitize_KSES, which runs
+        // wp_kses_post() over content:encoded while parsing, so get_content()
+        // hands this method the wrapper alone. An iframe survives only for a
+        // caller holding unsanitized feed HTML. Match on the embed host where
+        // there is one, and on the wrapper below where there is not.
         foreach ($xpath->query('//iframe[@src]') as $iframe) {
             if (! $iframe instanceof DOMElement || ! $this->is_attached($iframe)) {
                 continue;
@@ -772,6 +780,42 @@ class Substack_Sync_Processor
             // Replace the outermost wrapper, not just the iframe: it carries
             // Substack's padding-bottom aspect-ratio hack, and `style` survives
             // kses, so swapping only the iframe leaves a tall empty box.
+            $target = end($chain);
+            $target->parentNode->replaceChild($this->build_video_thumbnail_node($doc, $video_id), $target);
+        }
+
+        // The pass that actually fires on an imported post: the iframe is gone
+        // before the item reaches process_content(), so the wrapper's own
+        // attributes are the only record of the video left. Selected on the two
+        // attributes an ID can be read from, since a wrapper matched on nothing
+        // else could never yield one.
+        $wrappers = $xpath->query('//*[contains(@data-attrs, "videoId")] | //*[starts-with(@id, "youtube")]');
+
+        foreach ($wrappers as $node) {
+            // Document order, so an outer wrapper is replaced before any nested
+            // candidate, and the nested one is then detached rather than matched
+            // a second time inside content that no longer holds it.
+            if (! $node instanceof DOMElement || ! $this->is_attached($node)) {
+                continue;
+            }
+
+            // An embed whose iframe is still standing was either rewritten by
+            // the loop above or is not YouTube's. Either way it is a live player
+            // and this pass must not touch it.
+            if ($node->getElementsByTagName('iframe')->length > 0) {
+                continue;
+            }
+
+            if (! $this->is_youtube_wrapper($node)) {
+                continue;
+            }
+
+            $chain = $this->youtube_embed_chain($node, $wrapper);
+            $video_id = $this->youtube_id_from_embed($chain);
+            if ($video_id === null) {
+                continue;
+            }
+
             $target = end($chain);
             $target->parentNode->replaceChild($this->build_video_thumbnail_node($doc, $video_id), $target);
         }
@@ -858,6 +902,34 @@ class Substack_Sync_Processor
     }
 
     /**
+     * Whether an element is one of Substack's YouTube embed wrappers.
+     *
+     * Three independent signals, because the markup has changed shape across
+     * editor versions and a post archive spans every version the site imported
+     * through. All three have to name YouTube: a data-attrs videoId on its own
+     * is not enough, since Substack writes that key for other embed types too,
+     * and rewriting one of those would point both the frame and the link at an
+     * ID that was never a YouTube ID.
+     *
+     * @param DOMElement $node The candidate wrapper.
+     * @return bool True when the element is a YouTube embed wrapper.
+     */
+    private function is_youtube_wrapper(DOMElement $node): bool
+    {
+        if (preg_match('/^youtube\d*-/i', $node->getAttribute('id')) === 1) {
+            return true;
+        }
+
+        // Token match inside the class attribute, not a substring test:
+        // "youtube-wrap" is a prefix of any number of unrelated class names.
+        if (preg_match('/(?<![-\w])youtube-wrap(?![-\w])/i', $node->getAttribute('class')) === 1) {
+            return true;
+        }
+
+        return stripos($node->getAttribute('data-component-name'), 'youtube') !== false;
+    }
+
+    /**
      * The embed's node chain: the iframe, then each ancestor that wraps the
      * embed and nothing else, innermost first, stopping before $boundary.
      *
@@ -927,10 +999,10 @@ class Substack_Sync_Processor
      * is merely present lets one garbage value mask a usable sibling.
      *
      * @param list<DOMElement> $chain The embed chain, innermost first.
-     * @param string $src The iframe src attribute.
+     * @param string $src The iframe src attribute, '' when no iframe survived.
      * @return string|null The video ID, or null when no source yields a valid one.
      */
-    private function youtube_id_from_embed(array $chain, string $src): ?string
+    private function youtube_id_from_embed(array $chain, string $src = ''): ?string
     {
         foreach ($this->youtube_id_candidates($chain, $src) as $candidate) {
             // Feed content is attacker-influenced; never interpolate an
@@ -949,10 +1021,10 @@ class Substack_Sync_Processor
      * Video-ID candidates for an embed, in order of preference.
      *
      * @param list<DOMElement> $chain The embed chain, innermost first.
-     * @param string $src The iframe src attribute.
+     * @param string $src The iframe src attribute, '' when no iframe survived.
      * @return list<string> Unvalidated candidates.
      */
-    private function youtube_id_candidates(array $chain, string $src): array
+    private function youtube_id_candidates(array $chain, string $src = ''): array
     {
         $candidates = [];
 
@@ -973,7 +1045,10 @@ class Substack_Sync_Processor
         }
 
         // Path only, so a ?start=30 or a trailing slash never lands in the ID.
-        $candidates[] = basename(rtrim((string) wp_parse_url($src, PHP_URL_PATH), '/'));
+        // Skipped rather than yielding '' when the caller had no iframe to read.
+        if ($src !== '') {
+            $candidates[] = basename(rtrim((string) wp_parse_url($src, PHP_URL_PATH), '/'));
+        }
 
         return $candidates;
     }
@@ -1917,11 +1992,11 @@ class Substack_Sync_Processor
      *
      * wp_kses_post() ate the <iframe> and left Substack's wrapper standing, so
      * a legacy video post is an empty div carrying the wrapper class, the
-     * "youtube<n>-<ID>" element id, and the data-attrs JSON. Matching on those
-     * is what the live rewrite deliberately stopped doing, because Substack's
-     * markup changes across editor versions, and a post archive spans however
-     * many versions the site has been importing through. So this does not rest
-     * on any one of them: it asks all three and takes whichever appears first,
+     * "youtube<n>-<ID>" element id, and the data-attrs JSON. The live rewrite
+     * reads the same three signals, since Substack's markup changes across
+     * editor versions and a post archive spans however many versions the site
+     * has been importing through. Neither pass rests on any one of them: this
+     * one asks all three and takes whichever appears first,
      * because missing a legacy post is what forfeits it and the errors are not
      * symmetric. Presence is the whole question here, so unlike the ID
      * extraction on the live path these tests validate nothing.
