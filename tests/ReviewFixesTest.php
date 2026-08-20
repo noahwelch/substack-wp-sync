@@ -497,6 +497,22 @@ class ReviewFixesTest extends TestCase
         $this->assertStringContainsString('player.vimeo.com', $output);
     }
 
+    public function test_foreign_iframe_carrying_the_wrapper_id_is_left_alone(): void
+    {
+        update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
+
+        // The wrapper signal on the iframe itself, with no wrapper div at all.
+        // A descendant-only guard reads this as "no iframe here" and replaces a
+        // live player with a frame for an ID YouTube never issued.
+        $output = $this->invokeProcessContent(
+            '<iframe id="youtube2-abcdefghijk" src="https://player.vimeo.com/video/12345"></iframe>'
+        );
+
+        $this->assertStringNotContainsString('substack-video-embed', $output);
+        $this->assertStringNotContainsString('img.youtube.com', $output);
+        $this->assertStringContainsString('player.vimeo.com', $output);
+    }
+
     public function test_the_content_fetch_feed_delivers_wins_the_featured_slot(): void
     {
         global $_wp_sideload_calls, $_wp_thumbnails, $_wp_post_meta;
@@ -534,8 +550,9 @@ class ReviewFixesTest extends TestCase
 
     // ---------------------------------------------------------------
     // Featured-image repair: set_post_thumbnail() is gated on
-    // ! has_post_thumbnail(), so video posts imported before the embed
-    // rewrite keep the body photo they wrongly picked. One-time pass.
+    // ! has_post_thumbnail(), so video posts imported while the embed
+    // rewrite was not reaching them (every version through 1.3.1) keep
+    // the body photo they wrongly picked. One-time pass.
     // ---------------------------------------------------------------
 
     public function test_repair_points_a_previously_imported_video_post_at_its_video_frame(): void
@@ -1548,6 +1565,78 @@ class ReviewFixesTest extends TestCase
                 . '<img src="https://files.example.com/youtube-KNFJSIj6xfQ.jpg"></a>'
                 . '</figure><p>Body</p><img src="https://files.example.com/later-photo.jpg">',
         ]);
+    }
+
+    // ---------------------------------------------------------------
+    // Version-keyed upgrade: the repair pass sets its own done flag,
+    // and every version through 1.3.1 set it while the rewrite was
+    // inert. An update has to put the pass back in play itself.
+    // ---------------------------------------------------------------
+
+    public function test_upgrade_rearms_a_repair_that_ran_while_the_rewrite_was_inert(): void
+    {
+        // 1.3.0 set the flag on its first sync without recording a worklist, so
+        // the settings screen had no rerun button to offer: without the upgrade
+        // clearing this, the site has no way back to the pass at all.
+        update_option('substack_sync_video_thumbnail_repaired', true);
+
+        (new Substack_Sync_Processor())->maybe_upgrade('1.3.2');
+
+        $this->assertFalse(
+            get_option('substack_sync_video_thumbnail_repaired'),
+            'The upgrade must put the repair back in play'
+        );
+        $this->assertSame('1.3.2', get_option('substack_sync_version'));
+    }
+
+    public function test_upgrade_keeps_the_worklist_while_clearing_the_spent_budget(): void
+    {
+        update_option('substack_sync_version', '1.3.1');
+        update_option('substack_sync_video_thumbnail_repaired', true);
+        update_option('substack_sync_video_thumbnail_repair_attempts', 5);
+        update_option('substack_sync_video_thumbnail_repair_advanced_at', 1000);
+        update_option('substack_sync_video_thumbnail_repair_unrepaired', ['count' => 2, 'ids' => [1000, 1001]]);
+
+        (new Substack_Sync_Processor())->maybe_upgrade('1.3.2');
+
+        $this->assertFalse(get_option('substack_sync_video_thumbnail_repaired'));
+        $this->assertFalse(
+            get_option('substack_sync_video_thumbnail_repair_attempts'),
+            'The pass needs its full budget back, not the one a stalled pass spent'
+        );
+        $this->assertFalse(get_option('substack_sync_video_thumbnail_repair_advanced_at'));
+        $this->assertSame(
+            ['count' => 2, 'ids' => [1000, 1001]],
+            get_option('substack_sync_video_thumbnail_repair_unrepaired'),
+            'Until the pass finishes, the worklist still names posts that are still unrepaired'
+        );
+    }
+
+    public function test_upgrade_is_a_no_op_once_the_running_version_is_stamped(): void
+    {
+        update_option('substack_sync_version', '1.3.2');
+        update_option('substack_sync_video_thumbnail_repaired', true);
+
+        (new Substack_Sync_Processor())->maybe_upgrade('1.3.2');
+
+        $this->assertTrue(
+            (bool) get_option('substack_sync_video_thumbnail_repaired'),
+            'This runs on every request, so a finished pass must not be re-armed by it'
+        );
+    }
+
+    public function test_a_later_version_does_not_rearm_the_repair(): void
+    {
+        update_option('substack_sync_version', '1.3.2');
+        update_option('substack_sync_video_thumbnail_repaired', true);
+
+        (new Substack_Sync_Processor())->maybe_upgrade('1.4.0');
+
+        $this->assertTrue(
+            (bool) get_option('substack_sync_video_thumbnail_repaired'),
+            'Only the versions that shipped the inert rewrite need the re-arm'
+        );
+        $this->assertSame('1.4.0', get_option('substack_sync_version'));
     }
 
     // ---------------------------------------------------------------

@@ -81,6 +81,17 @@ class Substack_Sync_Processor
     private const VIDEO_THUMBNAIL_REPAIR_MAX_ATTEMPTS = 5;
 
     /**
+     * Option recording the plugin version this site's stored data was last
+     * brought forward for.
+     */
+    private const UPGRADED_VERSION_OPTION = 'substack_sync_version';
+
+    /**
+     * First version whose video rewrite actually fires on an imported post.
+     */
+    private const VIDEO_REWRITE_FIXED_VERSION = '1.3.2';
+
+    /**
      * How many unrepaired post IDs the pass records when it gives up. Enough to
      * work through by hand; past that the list is a symptom, not a worklist.
      * The recorded count stays exact regardless.
@@ -801,8 +812,11 @@ class Substack_Sync_Processor
 
             // An embed whose iframe is still standing was either rewritten by
             // the loop above or is not YouTube's. Either way it is a live player
-            // and this pass must not touch it.
-            if ($node->getElementsByTagName('iframe')->length > 0) {
+            // and this pass must not touch it. The node itself counts:
+            // getElementsByTagName() reads descendants only, and an iframe
+            // carrying the wrapper's own id would otherwise walk straight past a
+            // guard written to stop exactly that.
+            if ($node->nodeName === 'iframe' || $node->getElementsByTagName('iframe')->length > 0) {
                 continue;
             }
 
@@ -1613,8 +1627,10 @@ class Substack_Sync_Processor
     }
 
     /**
-     * One-time repair of featured images on video posts imported before the
-     * YouTube embed rewrite existed.
+     * One-time repair of featured images on video posts imported while the
+     * YouTube embed rewrite was not reaching them, which is every version
+     * through 1.3.1: the rewrite shipped in 1.3.0 but matched on an iframe that
+     * fetch_feed() had already stripped, so it never fired on an imported post.
      *
      * Those posts had no <img> at all in their stored content, because kses had
      * eaten the iframe, so process_post_images() took the featured image from
@@ -1874,6 +1890,46 @@ class Substack_Sync_Processor
             'count' => max($count - (count($ids) - count($outstanding)), count($outstanding)),
             'ids' => $outstanding,
         ];
+    }
+
+    /**
+     * Bring a site's stored state forward after a plugin update.
+     *
+     * 1.3.0 and 1.3.1 shipped a video rewrite that never fired, so the repair
+     * pass read a site with unrewritten video posts as a site with nothing to
+     * repair and set its done flag. Without this, 1.3.2 would fix the content
+     * and leave every existing video post's featured image on the wrong photo,
+     * with no way to reach the pass again: 1.3.0 set the flag on its first sync
+     * without recording a worklist, and the settings screen renders the rerun
+     * button only where a worklist exists. Re-arm so the upgrade finishes
+     * itself rather than waiting on a click that has nowhere to appear.
+     *
+     * The give-up report survives, for the reason rearm_video_thumbnail_repair()
+     * gives: re-arming is a side effect here, and until the pass finishes the
+     * report still names posts that are still unrepaired.
+     *
+     * The version arrives as an argument rather than being read from
+     * SUBSTACK_SYNC_VERSION, so the upgrade can be exercised without the plugin
+     * bootstrap defining it.
+     *
+     * @param string $version The running plugin version.
+     */
+    public function maybe_upgrade(string $version): void
+    {
+        $stored = (string) get_option(self::UPGRADED_VERSION_OPTION, '');
+
+        if ($stored === $version) {
+            return;
+        }
+
+        // '' is a site from before this option existed, which is every site that
+        // ever ran the broken rewrite, so it re-arms like the rest. On a fresh
+        // install the deletes are no-ops.
+        if (version_compare($stored, self::VIDEO_REWRITE_FIXED_VERSION, '<')) {
+            $this->rearm_video_thumbnail_repair();
+        }
+
+        update_option(self::UPGRADED_VERSION_OPTION, $version);
     }
 
     /**
