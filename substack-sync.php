@@ -6,7 +6,7 @@ declare(strict_types=1);
  * Plugin Name:       Substack Sync
  * Plugin URI:        https://www.christopherspenn.com/2025/08/substack-sync-for-wordpress/
  * Description:       A fork of Christopher S. Penn's Substack Sync, with additional bug fixes and hardening. Syncs a Substack RSS feed to your WordPress site. NO SUPPORT PROVIDED. Use at your own risk. If it lights your computer on fire, it's not the author's fault.
- * Version:           1.3.1
+ * Version:           1.3.2
  * Author:            Christopher S. Penn
  * Author URI:        https://www.christopherspenn.com/
  * Fork Maintainer:   Noah Welch
@@ -25,7 +25,7 @@ if (! defined('WPINC')) {
 }
 
 // Define Plugin Constants
-define('SUBSTACK_SYNC_VERSION', '1.3.1');
+define('SUBSTACK_SYNC_VERSION', '1.3.2');
 define('SUBSTACK_SYNC_PLUGIN_DIR', plugin_dir_path(__FILE__));
 
 /**
@@ -80,3 +80,22 @@ function substack_sync_maybe_backfill_source_urls(): void
     (new Substack_Sync_Processor())->backfill_source_urls();
 }
 add_action('admin_init', 'substack_sync_maybe_backfill_source_urls');
+
+/**
+ * Run the one-time data upgrades a new plugin version needs.
+ *
+ * On plugins_loaded rather than admin_init, unlike the backfill above: the sync
+ * that acts on an upgrade runs on cron, so gating this on a capable admin page
+ * load would leave a site whose owner never opens wp-admin on the old state
+ * indefinitely. The option read here keeps the ordinary request from
+ * constructing the processor at all.
+ */
+function substack_sync_maybe_upgrade(): void
+{
+    if (get_option('substack_sync_version') === SUBSTACK_SYNC_VERSION) {
+        return;
+    }
+
+    (new Substack_Sync_Processor())->maybe_upgrade(SUBSTACK_SYNC_VERSION);
+}
+add_action('plugins_loaded', 'substack_sync_maybe_upgrade');

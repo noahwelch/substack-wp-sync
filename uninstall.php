@@ -27,8 +27,9 @@ function substack_sync_uninstall_current_site(): void
         return;
     }
 
-    // Delete plugin settings and the one-time backfill flag
+    // Delete plugin settings, the version stamp, and the one-time pass flags
     delete_option('substack_sync_settings');
+    delete_option('substack_sync_version');
     delete_option('substack_sync_source_url_backfilled');
     delete_option('substack_sync_video_thumbnail_repaired');
     delete_option('substack_sync_video_thumbnail_repair_attempts');

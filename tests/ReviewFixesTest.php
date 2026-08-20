@@ -257,10 +257,12 @@ class ReviewFixesTest extends TestCase
     }
 
     // ---------------------------------------------------------------
-    // YouTube embeds: Substack ships them as an <iframe>, which
-    // wp_kses_post() strips, so video posts arrived with an empty
-    // wrapper div and no image. They are rewritten to a linked
-    // thumbnail before sanitization.
+    // YouTube embeds: Substack ships them as an <iframe> in a wrapper
+    // div, and wp_kses_post() strips the iframe, so video posts
+    // arrived as an empty wrapper with no image. They are rewritten to
+    // a linked thumbnail, matched on the embed host where an iframe is
+    // still present and on the wrapper where it is not. On an imported
+    // post it never is: fetch_feed() sanitizes while parsing.
     // ---------------------------------------------------------------
 
     public function test_process_content_replaces_youtube_embed_with_linked_thumbnail(): void
@@ -426,10 +428,131 @@ class ReviewFixesTest extends TestCase
         $this->assertStringContainsString('<p>Intro</p>', $output);
     }
 
+    public function test_wrapper_alone_is_rewritten_once_the_iframe_is_gone(): void
+    {
+        update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
+
+        // What get_content() actually returns for a video post: fetch_feed()
+        // sanitizes content:encoded with WP_SimplePie_Sanitize_KSES while
+        // parsing, so the iframe is already gone and only the wrapper arrives.
+        $output = $this->invokeProcessContent(
+            '<div id="youtube2-noBX7D2-7hA" class="youtube-wrap"'
+            . ' data-attrs="{&quot;videoId&quot;:&quot;noBX7D2-7hA&quot;,&quot;startTime&quot;:null}"'
+            . ' data-component-name="Youtube2ToDOM"><div class="youtube-inner"></div></div>'
+            . '<h1>The Episode Concept</h1>'
+        );
+
+        $this->assertStringNotContainsString('youtube-wrap', $output, 'The emptied wrapper must not survive');
+        $this->assertStringNotContainsString('youtube-inner', $output);
+        $this->assertStringContainsString('substack-video-embed', $output);
+        $this->assertStringContainsString('src="https://img.youtube.com/vi/noBX7D2-7hA/maxresdefault.jpg"', $output);
+        $this->assertStringContainsString('href="https://www.youtube.com/watch?v=noBX7D2-7hA"', $output);
+        $this->assertStringContainsString('<h1>The Episode Concept</h1>', $output, 'Body copy after the embed must survive');
+    }
+
+    public function test_wrapper_alone_is_rewritten_from_the_element_id(): void
+    {
+        update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
+
+        // No iframe and no data-attrs: with the embed stripped, the element id
+        // is the only record of the video left in the content.
+        $output = $this->invokeProcessContent('<div id="youtube2-KNFJSIj6xfQ" class="youtube-wrap"></div>');
+
+        $this->assertStringContainsString('vi/KNFJSIj6xfQ/maxresdefault.jpg', $output);
+        $this->assertStringContainsString('watch?v=KNFJSIj6xfQ', $output);
+    }
+
+    public function test_non_youtube_wrapper_carrying_a_video_id_is_left_alone(): void
+    {
+        update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
+
+        // Substack writes data-attrs videoId for other embed types too, and
+        // their IDs are not YouTube IDs, so nothing here names YouTube and
+        // nothing may be rewritten. The word in the prose is what gets the
+        // content past the cheap pre-check.
+        $output = $this->invokeProcessContent(
+            '<p>Not a youtube post.</p>'
+            . '<div class="native-video-embed" data-attrs=\'{"videoId":"abcdefghijk"}\''
+            . ' data-component-name="NativeVideoToDOM"></div>'
+        );
+
+        $this->assertStringNotContainsString('substack-video-embed', $output);
+        $this->assertStringNotContainsString('img.youtube.com', $output);
+        $this->assertStringContainsString('native-video-embed', $output, 'The other embed must pass through untouched');
+    }
+
+    public function test_wrapper_around_a_surviving_foreign_iframe_is_left_alone(): void
+    {
+        update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
+
+        // An iframe still standing is a live player. Replacing it on the
+        // strength of a videoId that YouTube never issued would trade a working
+        // embed for a 404 frame and a dead link.
+        $output = $this->invokeProcessContent(
+            '<div class="youtube-wrap" data-attrs=\'{"videoId":"abcdefghijk"}\'>'
+            . '<iframe src="https://player.vimeo.com/video/12345"></iframe></div>'
+        );
+
+        $this->assertStringNotContainsString('substack-video-embed', $output);
+        $this->assertStringContainsString('player.vimeo.com', $output);
+    }
+
+    public function test_foreign_iframe_carrying_the_wrapper_id_is_left_alone(): void
+    {
+        update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
+
+        // The wrapper signal on the iframe itself, with no wrapper div at all.
+        // A descendant-only guard reads this as "no iframe here" and replaces a
+        // live player with a frame for an ID YouTube never issued.
+        $output = $this->invokeProcessContent(
+            '<iframe id="youtube2-abcdefghijk" src="https://player.vimeo.com/video/12345"></iframe>'
+        );
+
+        $this->assertStringNotContainsString('substack-video-embed', $output);
+        $this->assertStringNotContainsString('img.youtube.com', $output);
+        $this->assertStringContainsString('player.vimeo.com', $output);
+    }
+
+    public function test_the_content_fetch_feed_delivers_wins_the_featured_slot(): void
+    {
+        global $_wp_sideload_calls, $_wp_thumbnails, $_wp_post_meta;
+
+        update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
+
+        // The whole production order, which is what an iframe-only match missed:
+        // sanitize on the way in (fetch_feed), then process_content(), then
+        // sanitize again (prepare_post_data), then localize images.
+        $delivered = wp_kses_post(
+            '<div id="youtube2-KNFJSIj6xfQ" class="youtube-wrap" data-attrs="{&quot;videoId&quot;:&quot;KNFJSIj6xfQ&quot;}"'
+            . ' data-component-name="Youtube2ToDOM"><div class="youtube-inner">'
+            . '<iframe src="https://www.youtube-nocookie.com/embed/KNFJSIj6xfQ"></iframe></div></div>'
+            . '<p>Body</p><img src="https://cdn.example.com/later-photo.jpg">'
+        );
+
+        $this->assertStringNotContainsString('<iframe', $delivered, 'Sanitization on the way in eats the iframe');
+
+        $content = wp_kses_post($this->invokeProcessContent($delivered));
+        $post_id = wp_insert_post(['post_title' => 'Video post', 'post_content' => $content, 'post_status' => 'publish']);
+        $this->invokeProcessPostImages($post_id, $content);
+
+        $this->assertSame(
+            'https://img.youtube.com/vi/KNFJSIj6xfQ/maxresdefault.jpg',
+            $_wp_sideload_calls[0] ?? null,
+            'The frame must be sideloaded from the wrapper the feed actually delivers'
+        );
+        $this->assertArrayHasKey($post_id, $_wp_thumbnails, 'A video post must end up with a featured image');
+        $this->assertSame(
+            'https://img.youtube.com/vi/KNFJSIj6xfQ/maxresdefault.jpg',
+            $_wp_post_meta[$_wp_thumbnails[$post_id]]['_substack_sync_source_url'] ?? null,
+            'The embed leads the post, so the video frame wins the featured slot over the later body photo'
+        );
+    }
+
     // ---------------------------------------------------------------
     // Featured-image repair: set_post_thumbnail() is gated on
-    // ! has_post_thumbnail(), so video posts imported before the embed
-    // rewrite keep the body photo they wrongly picked. One-time pass.
+    // ! has_post_thumbnail(), so video posts imported while the embed
+    // rewrite was not reaching them (every version through 1.3.1) keep
+    // the body photo they wrongly picked. One-time pass.
     // ---------------------------------------------------------------
 
     public function test_repair_points_a_previously_imported_video_post_at_its_video_frame(): void
@@ -1445,6 +1568,78 @@ class ReviewFixesTest extends TestCase
     }
 
     // ---------------------------------------------------------------
+    // Version-keyed upgrade: the repair pass sets its own done flag,
+    // and every version through 1.3.1 set it while the rewrite was
+    // inert. An update has to put the pass back in play itself.
+    // ---------------------------------------------------------------
+
+    public function test_upgrade_rearms_a_repair_that_ran_while_the_rewrite_was_inert(): void
+    {
+        // 1.3.0 set the flag on its first sync without recording a worklist, so
+        // the settings screen had no rerun button to offer: without the upgrade
+        // clearing this, the site has no way back to the pass at all.
+        update_option('substack_sync_video_thumbnail_repaired', true);
+
+        (new Substack_Sync_Processor())->maybe_upgrade('1.3.2');
+
+        $this->assertFalse(
+            get_option('substack_sync_video_thumbnail_repaired'),
+            'The upgrade must put the repair back in play'
+        );
+        $this->assertSame('1.3.2', get_option('substack_sync_version'));
+    }
+
+    public function test_upgrade_keeps_the_worklist_while_clearing_the_spent_budget(): void
+    {
+        update_option('substack_sync_version', '1.3.1');
+        update_option('substack_sync_video_thumbnail_repaired', true);
+        update_option('substack_sync_video_thumbnail_repair_attempts', 5);
+        update_option('substack_sync_video_thumbnail_repair_advanced_at', 1000);
+        update_option('substack_sync_video_thumbnail_repair_unrepaired', ['count' => 2, 'ids' => [1000, 1001]]);
+
+        (new Substack_Sync_Processor())->maybe_upgrade('1.3.2');
+
+        $this->assertFalse(get_option('substack_sync_video_thumbnail_repaired'));
+        $this->assertFalse(
+            get_option('substack_sync_video_thumbnail_repair_attempts'),
+            'The pass needs its full budget back, not the one a stalled pass spent'
+        );
+        $this->assertFalse(get_option('substack_sync_video_thumbnail_repair_advanced_at'));
+        $this->assertSame(
+            ['count' => 2, 'ids' => [1000, 1001]],
+            get_option('substack_sync_video_thumbnail_repair_unrepaired'),
+            'Until the pass finishes, the worklist still names posts that are still unrepaired'
+        );
+    }
+
+    public function test_upgrade_is_a_no_op_once_the_running_version_is_stamped(): void
+    {
+        update_option('substack_sync_version', '1.3.2');
+        update_option('substack_sync_video_thumbnail_repaired', true);
+
+        (new Substack_Sync_Processor())->maybe_upgrade('1.3.2');
+
+        $this->assertTrue(
+            (bool) get_option('substack_sync_video_thumbnail_repaired'),
+            'This runs on every request, so a finished pass must not be re-armed by it'
+        );
+    }
+
+    public function test_a_later_version_does_not_rearm_the_repair(): void
+    {
+        update_option('substack_sync_version', '1.3.2');
+        update_option('substack_sync_video_thumbnail_repaired', true);
+
+        (new Substack_Sync_Processor())->maybe_upgrade('1.4.0');
+
+        $this->assertTrue(
+            (bool) get_option('substack_sync_video_thumbnail_repaired'),
+            'Only the versions that shipped the inert rewrite need the re-arm'
+        );
+        $this->assertSame('1.4.0', get_option('substack_sync_version'));
+    }
+
+    // ---------------------------------------------------------------
     // SSRF guard: filter_var reports CGNAT (RFC 6598) and 192.0.0.0/24
     // (RFC 6890) as public, so those literals slipped past the guard.
     // ---------------------------------------------------------------
@@ -2062,6 +2257,35 @@ class ReviewFixesTest extends TestCase
 
         $this->assertArrayNotHasKey($post_id, $_wp_thumbnails, 'Featured image must not point at a since-deleted attachment');
         $this->assertNull($localized, 'Nothing should be rewritten when the only image resolves to no local URL');
+    }
+
+    // ---------------------------------------------------------------
+    // Uninstall coverage: every option the processor owns has to be
+    // named in uninstall.php, or opting into data deletion leaves rows
+    // behind. Driven off the constants so a new option fails this too.
+    // ---------------------------------------------------------------
+
+    public function test_uninstall_deletes_every_option_the_processor_owns(): void
+    {
+        $uninstall = file_get_contents(SUBSTACK_SYNC_PLUGIN_DIR . 'uninstall.php');
+        $constants = (new ReflectionClass(Substack_Sync_Processor::class))->getConstants();
+
+        $owned = [];
+        foreach ($constants as $name => $value) {
+            if (str_ends_with($name, '_OPTION')) {
+                $owned[$name] = $value;
+            }
+        }
+
+        $this->assertNotEmpty($owned, 'The processor must declare its option names as constants');
+
+        foreach ($owned as $name => $option) {
+            $this->assertStringContainsString(
+                "delete_option('{$option}')",
+                $uninstall,
+                "uninstall.php must delete {$name} ({$option})"
+            );
+        }
     }
 
     // ---------------------------------------------------------------
