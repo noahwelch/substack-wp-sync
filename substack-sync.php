@@ -24,9 +24,10 @@ if (! defined('WPINC')) {
     die;
 }
 
-// Define Plugin Constants
+// Define Plugin Constants. The directory is guarded because the test suite
+// defines it before loading anything, and redefining it here would warn.
 define('SUBSTACK_SYNC_VERSION', '1.3.2');
-define('SUBSTACK_SYNC_PLUGIN_DIR', plugin_dir_path(__FILE__));
+defined('SUBSTACK_SYNC_PLUGIN_DIR') || define('SUBSTACK_SYNC_PLUGIN_DIR', plugin_dir_path(__FILE__));
 
 /**
  * The code that runs during plugin activation.
@@ -89,6 +90,12 @@ add_action('admin_init', 'substack_sync_maybe_backfill_source_urls');
  * load would leave a site whose owner never opens wp-admin on the old state
  * indefinitely. The option read here keeps the ordinary request from
  * constructing the processor at all.
+ *
+ * The option name is spelled here as well as in the processor that owns it.
+ * They have to agree for the short-circuit to fire, and only for that: the
+ * upgrade decides what to do by reading the same option through its own
+ * constant, so a mismatch costs a processor construction per request rather
+ * than a skipped upgrade.
  */
 function substack_sync_maybe_upgrade(): void
 {
