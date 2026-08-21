@@ -7,8 +7,6 @@ declare(strict_types=1);
  *
  * Copyright (c) 2025 Christopher S. Penn
  * Licensed under Apache License Version 2.0
- *
- * NO SUPPORT PROVIDED. USE AT YOUR OWN RISK.
  */
 
 // If this file is called directly, abort.

@@ -2,7 +2,7 @@
 
 A WordPress plugin that automatically syncs Substack newsletter content to a self-hosted WordPress site.
 
-This is a fork of the original [Substack Sync](https://www.christopherspenn.com/2025/08/substack-sync-for-wordpress/) by Christopher S. Penn, with additional bug fixes and hardening. It is maintained for use on a single site.
+This is a fork of the original [Substack Sync](https://www.christopherspenn.com/2025/08/substack-sync-for-wordpress/) by Christopher S. Penn, with additional bug fixes and hardening.
 
 - **Original author:** Christopher S. Penn (https://www.christopherspenn.com/)
 - **Fork maintainer:** Noah Welch
@@ -30,7 +30,7 @@ Substack Sync imports posts from a Substack RSS feed into WordPress and keeps ex
 
 ## Installation
 
-1. Upload the `substack-sync` folder to your `/wp-content/plugins/` directory
+1. Upload the `substack-wp-sync` folder to your `/wp-content/plugins/` directory
 2. Activate the plugin through the 'Plugins' menu in WordPress
 3. Go to Settings > Substack Sync to configure your RSS feed URL
 
@@ -74,12 +74,15 @@ composer install
 
 # Run tests
 composer test
+
+# Build an installable zip in ~ from committed content
+./bin/build-plugin-zip.sh
 ```
 
 ## File Structure
 
 ```
-substack-sync/
+substack-wp-sync/
 ├── substack-sync.php                 # Main plugin file
 ├── uninstall.php                     # Uninstallation handler
 ├── admin/
