@@ -1912,6 +1912,13 @@ class Substack_Sync_Processor
      * SUBSTACK_SYNC_VERSION, so the upgrade can be exercised without the plugin
      * bootstrap defining it.
      *
+     * The stamp is the only thing that makes this run once, and the re-arm it
+     * guards clears the repair's attempt counter, which is that pass's only
+     * give-up bound. A stamp that failed to persist would hand the pass a fresh
+     * budget on every request and it could never stop. Stamping first trades
+     * that for the mirror failure, a re-arm that never happens, so the order
+     * stands and the coupling is written down instead.
+     *
      * @param string $version The running plugin version.
      */
     public function maybe_upgrade(string $version): void

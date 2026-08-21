@@ -1640,6 +1640,56 @@ class ReviewFixesTest extends TestCase
     }
 
     // ---------------------------------------------------------------
+    // Plugin wiring: the upgrade above only ever runs through the hook
+    // substack-sync.php registers, and no other test loads that file.
+    // A typo in the hook name would leave the whole suite green.
+    // ---------------------------------------------------------------
+
+    public function test_plugin_file_registers_its_one_time_data_passes(): void
+    {
+        require_once SUBSTACK_SYNC_PLUGIN_DIR . 'substack-sync.php';
+
+        $this->assertTrue(
+            has_action('plugins_loaded', 'substack_sync_maybe_upgrade'),
+            'The upgrade has to run for cron too, so it cannot wait on an admin page load'
+        );
+        $this->assertTrue(
+            has_action('admin_init', 'substack_sync_maybe_backfill_source_urls'),
+            'The backfill stays on admin_init, behind the capability check it gates itself on'
+        );
+    }
+
+    public function test_the_bootstrap_short_circuit_reads_the_option_the_upgrade_stamps(): void
+    {
+        require_once SUBSTACK_SYNC_PLUGIN_DIR . 'substack-sync.php';
+
+        // The option name is spelled in both files. If they ever disagreed, the
+        // first call would still upgrade and the second would upgrade again.
+        update_option('substack_sync_video_thumbnail_repaired', true);
+
+        substack_sync_maybe_upgrade();
+
+        $this->assertSame(
+            SUBSTACK_SYNC_VERSION,
+            get_option('substack_sync_version'),
+            'The first request after an update stamps the running version'
+        );
+        $this->assertFalse(
+            get_option('substack_sync_video_thumbnail_repaired'),
+            'and puts the repair back in play'
+        );
+
+        update_option('substack_sync_video_thumbnail_repaired', true);
+
+        substack_sync_maybe_upgrade();
+
+        $this->assertTrue(
+            (bool) get_option('substack_sync_video_thumbnail_repaired'),
+            'This fires on every request, so a stamped site must be left alone'
+        );
+    }
+
+    // ---------------------------------------------------------------
     // SSRF guard: filter_var reports CGNAT (RFC 6598) and 192.0.0.0/24
     // (RFC 6890) as public, so those literals slipped past the guard.
     // ---------------------------------------------------------------

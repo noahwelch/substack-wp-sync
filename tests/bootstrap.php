@@ -371,8 +371,66 @@ $GLOBALS['wpdb'] = new wpdb();
 
 // --- WordPress hooks/admin stubs ---
 
+$_wp_registered_actions = [];
+
+// Records what was registered, so a test can assert the plugin file's wiring.
+// A no-op stub made every hook registration invisible to the suite, which is
+// how a typo in a hook name would ship green.
 if (! function_exists('add_action')) {
-    function add_action(string $hook, $callback, int $priority = 10, int $accepted_args = 1): void {}
+    function add_action(string $hook, $callback, int $priority = 10, int $accepted_args = 1): void
+    {
+        global $_wp_registered_actions;
+        $_wp_registered_actions[$hook][] = $callback;
+    }
+}
+
+if (! function_exists('has_action')) {
+    function has_action(string $hook, $callback = null)
+    {
+        global $_wp_registered_actions;
+        $registered = $_wp_registered_actions[$hook] ?? [];
+
+        return $callback === null ? $registered !== [] : in_array($callback, $registered, true);
+    }
+}
+
+// Loading substack-sync.php runs the plugin's top-level wiring, which needs
+// these. The activation hooks and the cron scheduling are not what the wiring
+// tests assert, so they only have to exist.
+if (! function_exists('plugin_dir_path')) {
+    function plugin_dir_path(string $file): string
+    {
+        return dirname($file) . '/';
+    }
+}
+
+if (! function_exists('register_activation_hook')) {
+    function register_activation_hook(string $file, $callback): void {}
+}
+
+if (! function_exists('register_deactivation_hook')) {
+    function register_deactivation_hook(string $file, $callback): void {}
+}
+
+if (! function_exists('wp_next_scheduled')) {
+    function wp_next_scheduled(string $hook, array $args = [])
+    {
+        return false;
+    }
+}
+
+if (! function_exists('wp_schedule_event')) {
+    function wp_schedule_event(int $timestamp, string $recurrence, string $hook, array $args = [])
+    {
+        return true;
+    }
+}
+
+if (! function_exists('wp_doing_ajax')) {
+    function wp_doing_ajax(): bool
+    {
+        return false;
+    }
 }
 
 $_wp_added_filters = [];

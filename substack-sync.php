@@ -6,7 +6,7 @@ declare(strict_types=1);
  * Plugin Name:       Substack Sync
  * Plugin URI:        https://www.christopherspenn.com/2025/08/substack-sync-for-wordpress/
  * Description:       A fork of Christopher S. Penn's Substack Sync, with additional bug fixes and hardening. Syncs a Substack RSS feed to your WordPress site. NO SUPPORT PROVIDED. Use at your own risk. If it lights your computer on fire, it's not the author's fault.
- * Version:           1.3.2
+ * Version:           1.3.3
  * Author:            Christopher S. Penn
  * Author URI:        https://www.christopherspenn.com/
  * Fork Maintainer:   Noah Welch
@@ -24,9 +24,10 @@ if (! defined('WPINC')) {
     die;
 }
 
-// Define Plugin Constants
-define('SUBSTACK_SYNC_VERSION', '1.3.2');
-define('SUBSTACK_SYNC_PLUGIN_DIR', plugin_dir_path(__FILE__));
+// Define Plugin Constants. The directory is guarded because the test suite
+// defines it before loading anything, and redefining it here would warn.
+define('SUBSTACK_SYNC_VERSION', '1.3.3');
+defined('SUBSTACK_SYNC_PLUGIN_DIR') || define('SUBSTACK_SYNC_PLUGIN_DIR', plugin_dir_path(__FILE__));
 
 /**
  * The code that runs during plugin activation.
@@ -89,6 +90,12 @@ add_action('admin_init', 'substack_sync_maybe_backfill_source_urls');
  * load would leave a site whose owner never opens wp-admin on the old state
  * indefinitely. The option read here keeps the ordinary request from
  * constructing the processor at all.
+ *
+ * The option name is spelled here as well as in the processor that owns it.
+ * They have to agree for the short-circuit to fire, and only for that: the
+ * upgrade decides what to do by reading the same option through its own
+ * constant, so a mismatch costs a processor construction per request rather
+ * than a skipped upgrade.
  */
 function substack_sync_maybe_upgrade(): void
 {
