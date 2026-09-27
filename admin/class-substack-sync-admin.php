@@ -32,6 +32,66 @@ class Substack_Sync_Admin
         add_action('wp_ajax_substack_repair_videos', [$this, 'handle_repair_videos']);
         add_action('wp_ajax_substack_rollback_posts', [$this, 'handle_rollback_posts']);
         add_action('wp_ajax_substack_get_sync_stats', [$this, 'handle_get_sync_stats']);
+        add_filter('display_post_states', [$this, 'add_edited_post_state'], 10, 2);
+        add_filter('post_row_actions', [$this, 'add_resume_row_action'], 10, 2);
+        add_action('admin_post_substack_sync_resume', [$this, 'handle_resume_updates']);
+    }
+
+    /**
+     * Mark posts the sync has stopped updating in the Posts list.
+     * @return array<string, string>
+     */
+    public function add_edited_post_state(array $states, $post): array
+    {
+        if (Substack_Sync_Processor::is_edited_in_wordpress((int) $post->ID)) {
+            $states['substack_sync_edited'] = 'Substack updates paused';
+        }
+
+        return $states;
+    }
+
+    /**
+     * Offer to hand an edited post back to the sync.
+     * @return array<string, string>
+     */
+    public function add_resume_row_action(array $actions, $post): array
+    {
+        $post_id = (int) $post->ID;
+        if (! Substack_Sync_Processor::is_edited_in_wordpress($post_id) || ! current_user_can('edit_post', $post_id)) {
+            return $actions;
+        }
+
+        $url = wp_nonce_url(
+            admin_url('admin-post.php?action=substack_sync_resume&post=' . $post_id),
+            'substack_sync_resume_' . $post_id
+        );
+        $warning = 'The next sync will replace this post with its Substack version, undoing the edits made here.';
+
+        $actions['substack_sync_resume'] = sprintf(
+            '<a href="%s" onclick="return confirm(\'%s\');">Resume Substack updates</a>',
+            esc_url($url),
+            esc_js($warning)
+        );
+
+        return $actions;
+    }
+
+    /**
+     * The Resume Substack updates link's target.
+     */
+    public function handle_resume_updates(): void
+    {
+        $post_id = is_string($_GET['post'] ?? null) ? absint($_GET['post']) : 0;
+        check_admin_referer('substack_sync_resume_' . $post_id);
+
+        if ($post_id <= 0 || ! current_user_can('edit_post', $post_id)) {
+            wp_die('You are not allowed to change this post.', '', ['response' => 403]);
+        }
+
+        Substack_Sync_Processor::resume_substack_updates($post_id);
+
+        wp_safe_redirect(wp_get_referer() ?: admin_url('edit.php'));
+        exit;
     }
 
     /**
