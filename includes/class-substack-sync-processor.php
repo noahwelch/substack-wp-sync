@@ -51,6 +51,11 @@ class Substack_Sync_Processor
     private const SUBSTACK_POST_TRANSIENT_PREFIX = 'substack_sync_post_';
 
     /**
+     * Private post-meta key holding the post's last good Substack API answer.
+     */
+    private const SUBSTACK_POST_META_KEY = '_substack_sync_api_post';
+
+    /**
      * Option flag marking the one-time source-URL backfill as complete.
      */
     private const SOURCE_URL_BACKFILL_OPTION = 'substack_sync_source_url_backfilled';
@@ -371,7 +376,10 @@ class Substack_Sync_Processor
      */
     private function write_feed_item($item, ?array $existing_post, string $post_title, bool $return_status)
     {
-        $substack = $this->fetch_substack_post($item);
+        // Without an answer a video episode would be rewritten without its button,
+        // so an API outage reuses the post's last one, and only a new post has none.
+        $substack = $this->fetch_substack_post($item)
+            ?? ($existing_post ? $this->last_substack_post((int) $existing_post['post_id']) : null);
 
         if ($existing_post) {
             $result = $this->update_post($item, $existing_post, $return_status, $substack);
@@ -674,6 +682,7 @@ class Substack_Sync_Processor
                 }
 
                 $this->assign_bylines((int) $post_id, $item, $substack);
+                $this->remember_substack_post((int) $post_id, $substack);
             }
 
             if ($return_status) {
@@ -766,6 +775,7 @@ class Substack_Sync_Processor
             $this->log_sync($post_id, $guid, 'updated', $post_title);
             $this->store_source_url((int) $post_id, $item);
             $this->assign_bylines((int) $post_id, $item, $substack);
+            $this->remember_substack_post((int) $post_id, $substack);
 
             if ($return_status) {
                 return [
@@ -1940,7 +1950,7 @@ class Substack_Sync_Processor
 
     /**
      * Substack's post API: all bylines, a podcast's cover, whether there is video.
-     * Undocumented, so null means use the feed. Cached 12h per post, failures 1h.
+     * Undocumented, so null means no answer. Cached 12h per post, failures 1h.
      */
     private function fetch_substack_post($item): ?array
     {
@@ -1966,6 +1976,28 @@ class Substack_Sync_Processor
         set_transient($key, ['post' => $post], $post === null ? HOUR_IN_SECONDS : 12 * HOUR_IN_SECONDS);
 
         return $post;
+    }
+
+    /**
+     * The API answer the post was last synced with, or null when it has none.
+     */
+    private function last_substack_post(int $post_id): ?array
+    {
+        $stored = get_post_meta($post_id, self::SUBSTACK_POST_META_KEY, true);
+
+        return is_array($stored)
+            && is_array($stored['bylines'] ?? null)
+            && is_string($stored['cover_image'] ?? null)
+            && is_bool($stored['has_video'] ?? null)
+            ? $stored
+            : null;
+    }
+
+    private function remember_substack_post(int $post_id, ?array $substack): void
+    {
+        if ($substack !== null) {
+            update_post_meta($post_id, self::SUBSTACK_POST_META_KEY, wp_slash($substack));
+        }
     }
 
     /**

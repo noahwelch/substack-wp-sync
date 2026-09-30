@@ -514,6 +514,62 @@ class EditsCoversBylinesTest extends TestCase
         $this->assertSame($after, $localized);
     }
 
+    // --- API outages ---
+
+    public function test_an_api_outage_reuses_the_posts_last_answer(): void
+    {
+        global $_wp_http_responses, $_wp_transients, $_wp_object_terms;
+
+        $post_id = $this->existingPost('The Clash Vs. Busyness');
+        $audio = 'https://api.substack.com/feed/podcast/211893209/67519b40dd741520259bbd7f32e6c5dc.mp3';
+        $item = $this->busynessItem(new SimplePie_Enclosure($audio, 'audio/mpeg'));
+        $_wp_http_responses[self::API] = $this->apiResponse([
+            'publishedBylines' => [['name' => 'Ricky Alcantar'], ['name' => 'Ben Kreps']],
+            'video_upload_id' => 'f1ce0644',
+        ]);
+        $this->invoke('process_feed_item', $item, true);
+
+        // The answer's cache runs out while the API is down.
+        $_wp_http_responses = [];
+        $_wp_transients = [];
+        $this->assertSame('updated', $this->invoke('process_feed_item', $item, true)['action']);
+
+        $this->assertStringContainsString('Watch the video on Substack', get_post($post_id)->post_content);
+        $this->assertSame(['Ricky Alcantar', 'Ben Kreps'], $_wp_object_terms[$post_id]['byline']);
+    }
+
+    public function test_a_new_post_remembers_its_answer_for_the_next_outage(): void
+    {
+        global $_wp_http_responses, $_wp_transients, $_wp_get_row_rows;
+
+        $_wp_http_responses[self::API] = $this->apiResponse(['video_upload_id' => 'f1ce0644']);
+        $audio = new SimplePie_Enclosure('https://api.substack.com/feed/podcast/1/episode.mp3', 'audio/mpeg');
+        $post_id = (int) $this->invoke('process_feed_item', $this->busynessItem($audio), true)['post_id'];
+
+        $_wp_http_responses = [];
+        $_wp_transients = [];
+        $_wp_get_row_rows = ["substack_guid = 'guid-busyness'" => ['post_id' => $post_id, 'retry_count' => 0]];
+        $this->invoke('process_feed_item', $this->busynessItem($audio), true);
+
+        $this->assertStringContainsString('Watch the video on Substack', get_post($post_id)->post_content);
+    }
+
+    public function test_the_stored_answer_keeps_its_backslashes(): void
+    {
+        global $_wp_http_responses, $_wp_transients, $_wp_object_terms;
+
+        $post_id = $this->existingPost('x');
+        $_wp_http_responses[self::API] = $this->apiResponse(['publishedBylines' => [['name' => 'A\B Byline']]]);
+        $this->invoke('process_feed_item', $this->busynessItem(), true);
+
+        $_wp_http_responses = [];
+        $_wp_transients = [];
+        wp_set_object_terms($post_id, [], 'byline');
+        $this->invoke('process_feed_item', $this->busynessItem(), true);
+
+        $this->assertSame(['A\B Byline'], $_wp_object_terms[$post_id]['byline']);
+    }
+
     // --- Backslashes: core's writers unslash, so unslashed feed text lost them ---
 
     public function test_backslashes_in_a_title_and_body_survive_the_import_and_the_update(): void

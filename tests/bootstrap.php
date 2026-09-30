@@ -319,8 +319,9 @@ if (! function_exists('get_post')) {
 if (! function_exists('update_post_meta')) {
     function update_post_meta($post_id, $meta_key, $meta_value): bool
     {
+        // Core's update_metadata() unslashes the value, like the post writers.
         global $_wp_post_meta;
-        $_wp_post_meta[$post_id][$meta_key] = $meta_value;
+        $_wp_post_meta[$post_id][$meta_key] = wp_unslash($meta_value);
         return true;
     }
 }
