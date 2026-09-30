@@ -163,13 +163,42 @@ $_wp_posts = [];
 $_wp_post_meta = [];
 $_wp_post_id_counter = 100;
 
+// Off by default: when on, the post-write stubs fire save_post_post the way core
+// does, so a test can show which saves the edit tracking counts as a person's.
+$_wp_fire_save_post = false;
+
+if (! function_exists('wp_slash')) {
+    function wp_slash($value)
+    {
+        if (is_array($value)) {
+            return array_map('wp_slash', $value);
+        }
+        return is_string($value) ? addslashes($value) : $value;
+    }
+}
+
+if (! function_exists('wp_unslash')) {
+    function wp_unslash($value)
+    {
+        if (is_array($value)) {
+            return array_map('wp_unslash', $value);
+        }
+        return is_string($value) ? stripslashes($value) : $value;
+    }
+}
+
+// Both unslash what they are given, as core's do: callers must pass slashed data.
 if (! function_exists('wp_insert_post')) {
     function wp_insert_post(array $postarr)
     {
-        global $_wp_posts, $_wp_post_id_counter;
+        global $_wp_posts, $_wp_post_id_counter, $_wp_fire_save_post;
         $id = $_wp_post_id_counter++;
+        $postarr = wp_unslash($postarr);
         $postarr['ID'] = $id;
         $_wp_posts[$id] = (object) $postarr;
+        if ($_wp_fire_save_post) {
+            do_action('save_post_post', $id, $_wp_posts[$id], false);
+        }
         return $id;
     }
 }
@@ -177,14 +206,105 @@ if (! function_exists('wp_insert_post')) {
 if (! function_exists('wp_update_post')) {
     function wp_update_post(array $postarr)
     {
-        global $_wp_posts;
+        global $_wp_posts, $_wp_fire_save_post;
         $id = $postarr['ID'] ?? 0;
         if (isset($_wp_posts[$id])) {
-            foreach ($postarr as $key => $value) {
+            foreach (wp_unslash($postarr) as $key => $value) {
                 $_wp_posts[$id]->$key = $value;
+            }
+            if ($_wp_fire_save_post) {
+                do_action('save_post_post', $id, $_wp_posts[$id], true);
             }
         }
         return $id;
+    }
+}
+
+if (! function_exists('get_post_field')) {
+    function get_post_field(string $field, $post)
+    {
+        global $_wp_posts;
+        return $_wp_posts[(int) $post]->$field ?? '';
+    }
+}
+
+if (! function_exists('wp_cache_delete')) {
+    function wp_cache_delete($key, string $group = ''): bool { return true; }
+}
+
+// Real core reads the site timezone; here it is the gmt_offset option, in hours.
+if (! function_exists('get_date_from_gmt')) {
+    function get_date_from_gmt(string $date, string $format = 'Y-m-d H:i:s'): string
+    {
+        return gmdate($format, strtotime($date . ' UTC') + (int) round((float) get_option('gmt_offset', 0) * 3600));
+    }
+}
+
+if (! function_exists('delete_post_meta')) {
+    function delete_post_meta($post_id, $meta_key): bool
+    {
+        global $_wp_post_meta;
+        unset($_wp_post_meta[$post_id][$meta_key]);
+        return true;
+    }
+}
+
+// --- Taxonomy stubs: terms are stored by name, per post and taxonomy ---
+
+$_wp_object_terms = [];
+$_wp_registered_taxonomies = [];
+
+if (! function_exists('register_taxonomy')) {
+    function register_taxonomy(string $taxonomy, $object_type, array $args = []): void
+    {
+        global $_wp_registered_taxonomies;
+        $_wp_registered_taxonomies[$taxonomy] = ['object_type' => $object_type, 'args' => $args];
+    }
+}
+
+if (! function_exists('wp_set_object_terms')) {
+    function wp_set_object_terms(int $object_id, $terms, string $taxonomy, bool $append = false)
+    {
+        // Core's term_exists() and wp_insert_term() unslash each name.
+        global $_wp_object_terms;
+        $_wp_object_terms[$object_id][$taxonomy] = array_values(wp_unslash((array) $terms));
+        return [];
+    }
+}
+
+if (! function_exists('has_term')) {
+    function has_term($term = '', string $taxonomy = '', $post = null): bool
+    {
+        global $_wp_object_terms;
+        return ($_wp_object_terms[(int) $post][$taxonomy] ?? []) !== [];
+    }
+}
+
+// --- HTTP stubs: responses are seeded by URL; anything unseeded fails ---
+
+$_wp_http_responses = [];
+$_wp_http_calls = [];
+
+if (! function_exists('wp_safe_remote_get')) {
+    function wp_safe_remote_get(string $url, array $args = [])
+    {
+        global $_wp_http_responses, $_wp_http_calls;
+        $_wp_http_calls[] = $url;
+        return $_wp_http_responses[$url] ?? new WP_Error('http_request_failed', 'stub: no network in tests');
+    }
+}
+
+if (! function_exists('wp_remote_retrieve_response_code')) {
+    function wp_remote_retrieve_response_code($response)
+    {
+        return is_array($response) ? ($response['response']['code'] ?? '') : '';
+    }
+}
+
+if (! function_exists('wp_remote_retrieve_body')) {
+    function wp_remote_retrieve_body($response): string
+    {
+        return is_array($response) ? (string) ($response['body'] ?? '') : '';
     }
 }
 
@@ -199,8 +319,9 @@ if (! function_exists('get_post')) {
 if (! function_exists('update_post_meta')) {
     function update_post_meta($post_id, $meta_key, $meta_value): bool
     {
+        // Core's update_metadata() unslashes the value, like the post writers.
         global $_wp_post_meta;
-        $_wp_post_meta[$post_id][$meta_key] = $meta_value;
+        $_wp_post_meta[$post_id][$meta_key] = wp_unslash($meta_value);
         return true;
     }
 }
@@ -250,8 +371,20 @@ if (! class_exists('SimplePie_Item')) {
         private string $permalink;
         private string $date;
 
-        public function __construct(string $title, string $content, string $id = '', string $permalink = '', string $date = '')
-        {
+        /**
+         * $raw is content:encoded as sent; $content is get_content(), which real
+         * fetch_feed() has already sanitized. They default to the same string.
+         */
+        public function __construct(
+            string $title,
+            string $content,
+            string $id = '',
+            string $permalink = '',
+            string $date = '',
+            private ?string $raw = null,
+            private ?SimplePie_Enclosure $enclosure = null,
+            private array $authors = []
+        ) {
             $this->title = $title;
             $this->content = $content;
             $this->id = $id ?: 'guid-' . md5($title);
@@ -271,7 +404,35 @@ if (! class_exists('SimplePie_Item')) {
         {
             return $this->get_date($format);
         }
-        public function get_author(): ?object { return null; }
+        public function get_author(): ?object { return $this->authors[0] ?? null; }
+        public function get_authors(): ?array { return $this->authors ?: null; }
+        public function get_enclosure(): ?SimplePie_Enclosure { return $this->enclosure; }
+
+        public function get_item_tags(string $namespace, string $tag): ?array
+        {
+            if ($namespace !== 'http://purl.org/rss/1.0/modules/content/' || $tag !== 'encoded') {
+                return null;
+            }
+
+            return [['data' => $this->raw ?? $this->content]];
+        }
+    }
+}
+
+if (! class_exists('SimplePie_Enclosure')) {
+    class SimplePie_Enclosure
+    {
+        public function __construct(private string $link, private string $type) {}
+        public function get_link(): string { return $this->link; }
+        public function get_type(): string { return $this->type; }
+    }
+}
+
+if (! class_exists('SimplePie_Author')) {
+    class SimplePie_Author
+    {
+        public function __construct(private ?string $name) {}
+        public function get_name(): ?string { return $this->name; }
     }
 }
 
@@ -291,6 +452,14 @@ if (! class_exists('wpdb')) {
 
         public function get_row(string $query, $output = 'OBJECT')
         {
+            // Seedable like get_results(): a query-substring needle maps to one row.
+            global $_wp_get_row_rows;
+            foreach ((array) ($_wp_get_row_rows ?? []) as $needle => $row) {
+                if (str_contains($query, (string) $needle)) {
+                    return $output === ARRAY_A ? $row : (object) $row;
+                }
+            }
+
             return null;
         }
 
@@ -381,6 +550,29 @@ if (! function_exists('add_action')) {
     {
         global $_wp_registered_actions;
         $_wp_registered_actions[$hook][] = $callback;
+    }
+}
+
+$_wp_current_actions = [];
+
+if (! function_exists('do_action')) {
+    function do_action(string $hook, ...$args): void
+    {
+        global $_wp_registered_actions, $_wp_current_actions;
+        $_wp_current_actions[] = $hook;
+        foreach ($_wp_registered_actions[$hook] ?? [] as $callback) {
+            $callback(...$args);
+        }
+        array_pop($_wp_current_actions);
+    }
+}
+
+if (! function_exists('doing_action')) {
+    function doing_action(?string $hook = null): bool
+    {
+        global $_wp_current_actions;
+        $current = (array) ($_wp_current_actions ?? []);
+        return $hook === null ? $current !== [] : in_array($hook, $current, true);
     }
 }
 
@@ -488,6 +680,14 @@ if (! function_exists('current_user_can')) {
 
 if (! function_exists('admin_url')) {
     function admin_url(string $path = ''): string { return 'https://example.com/wp-admin/' . $path; }
+}
+
+if (! function_exists('wp_nonce_url')) {
+    function wp_nonce_url(string $url, string $action = ''): string { return $url . '&_wpnonce=nonce-for-' . $action; }
+}
+
+if (! function_exists('esc_js')) {
+    function esc_js(string $text): string { return addslashes(htmlspecialchars($text, ENT_QUOTES, 'UTF-8')); }
 }
 
 if (! function_exists('settings_fields')) {
@@ -666,6 +866,26 @@ if (! class_exists('Stub_Feed_Item')) {
         {
             return date($format, 1700000000);
         }
+
+        public function get_gmdate(string $format): string
+        {
+            return gmdate($format, 1700000000);
+        }
+
+        public function get_item_tags(string $namespace, string $tag): ?array
+        {
+            return [['data' => $this->content]];
+        }
+
+        public function get_enclosure(): ?SimplePie_Enclosure
+        {
+            return null;
+        }
+
+        public function get_authors(): ?array
+        {
+            return null;
+        }
     }
 }
 
@@ -730,8 +950,11 @@ if (! function_exists('media_sideload_image')) {
 if (! function_exists('download_url')) {
     function download_url(string $url, int $timeout = 300)
     {
-        global $_wp_sideload_calls, $_wp_sideload_fail, $_wp_download_bytes;
+        global $_wp_sideload_calls, $_wp_sideload_fail, $_wp_download_bytes, $_wp_on_download;
         $_wp_sideload_calls[] = $url;
+        if (is_callable($_wp_on_download)) {
+            $_wp_on_download($url);
+        }
 
         // A scalar fails every download; an array fails only the URLs carrying
         // one of its substrings, which is what a per-URL 404 (a video with no
@@ -773,7 +996,11 @@ if (! function_exists('media_handle_sideload')) {
             return new WP_Error('sideload_failed', 'stub media_handle_sideload failure');
         }
 
-        return $_wp_post_id_counter++;
+        global $_wp_posts;
+        $id = $_wp_post_id_counter++;
+        $_wp_posts[$id] = (object) ['ID' => $id, 'post_type' => 'attachment', 'post_excerpt' => ''];
+
+        return $id;
     }
 }
 
@@ -852,6 +1079,52 @@ if (! function_exists('current_time')) {
     {
         return date('Y-m-d H:i:s');
     }
+}
+
+// --- Per-test reset of every stub's state ---
+
+function reset_wp_stubs(): void
+{
+    global $_wp_options, $_wp_transients, $_wp_deleted_transients, $_wp_added_filters,
+        $_wp_removed_filters, $_wp_sideload_calls, $_wp_sideload_fail, $_wp_thumbnails,
+        $_wp_post_id_counter, $_wp_posts, $_wp_post_meta, $_wp_site_transients,
+        $_wp_deleted_site_transients, $_wp_json_responses, $_wp_missing_attachments,
+        $_wp_get_results_rows, $_wp_download_bytes, $_wp_media_handle_fail, $_wp_feed_items,
+        $_wp_query_calls, $_wp_query_result, $_wp_get_results_calls, $_wp_fire_save_post,
+        $_wp_object_terms, $_wp_http_responses, $_wp_http_calls, $_wp_registered_taxonomies,
+        $_wp_get_row_rows, $_wp_current_actions, $_wp_on_download;
+
+    $_wp_on_download = null;
+    $_wp_current_actions = [];
+    $_wp_get_row_rows = [];
+    $_wp_fire_save_post = false;
+    $_wp_object_terms = [];
+    $_wp_http_responses = [];
+    $_wp_http_calls = [];
+    $_wp_registered_taxonomies = [];
+    $_wp_get_results_calls = [];
+    $_wp_query_calls = [];
+    $_wp_query_result = null;
+    $_wp_feed_items = null;
+    $_wp_download_bytes = null;
+    $_wp_media_handle_fail = false;
+    $_wp_get_results_rows = [];
+    $_wp_post_id_counter = 1000;
+    $_wp_posts = [];
+    $_wp_post_meta = [];
+    $_wp_options = [];
+    $_wp_transients = [];
+    $_wp_deleted_transients = [];
+    $_wp_site_transients = [];
+    $_wp_deleted_site_transients = [];
+    $_wp_json_responses = [];
+    $_wp_added_filters = [];
+    $_wp_removed_filters = [];
+    $_wp_sideload_calls = [];
+    $_wp_sideload_fail = false;
+    $_wp_thumbnails = [];
+    $_wp_missing_attachments = [];
+    $_POST = [];
 }
 
 // --- Load plugin classes ---

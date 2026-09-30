@@ -26,36 +26,7 @@ class ReviewFixesTest extends TestCase
 
     protected function setUp(): void
     {
-        global $_wp_options, $_wp_transients, $_wp_deleted_transients, $_wp_added_filters,
-            $_wp_removed_filters, $_wp_sideload_calls, $_wp_sideload_fail, $_wp_thumbnails,
-            $_wp_post_id_counter, $_wp_posts, $_wp_post_meta, $_wp_site_transients,
-            $_wp_deleted_site_transients, $_wp_json_responses, $_wp_missing_attachments,
-            $_wp_get_results_rows, $_wp_download_bytes, $_wp_media_handle_fail, $_wp_feed_items,
-            $_wp_query_calls, $_wp_query_result, $_wp_get_results_calls;
-
-        $_wp_get_results_calls = [];
-        $_wp_query_calls = [];
-        $_wp_query_result = null;
-        $_wp_feed_items = null;
-        $_wp_download_bytes = null;
-        $_wp_media_handle_fail = false;
-        $_wp_get_results_rows = [];
-        $_wp_post_id_counter = 1000;
-        $_wp_posts = [];
-        $_wp_post_meta = [];
-        $_wp_options = [];
-        $_wp_transients = [];
-        $_wp_deleted_transients = [];
-        $_wp_site_transients = [];
-        $_wp_deleted_site_transients = [];
-        $_wp_json_responses = [];
-        $_wp_added_filters = [];
-        $_wp_removed_filters = [];
-        $_wp_sideload_calls = [];
-        $_wp_sideload_fail = false;
-        $_wp_thumbnails = [];
-        $_wp_missing_attachments = [];
-        $_POST = [];
+        reset_wp_stubs();
     }
 
     // ---------------------------------------------------------------
@@ -256,16 +227,11 @@ class ReviewFixesTest extends TestCase
         $this->assertStringContainsString('substack-subscribe-block', $output);
     }
 
-    // ---------------------------------------------------------------
-    // YouTube embeds: Substack ships them as an <iframe> in a wrapper
-    // div, and wp_kses_post() strips the iframe, so video posts
-    // arrived as an empty wrapper with no image. They are rewritten to
-    // a linked thumbnail, matched on the embed host where an iframe is
-    // still present and on the wrapper where it is not. On an imported
-    // post it never is: fetch_feed() sanitizes while parsing.
-    // ---------------------------------------------------------------
+    // Embeds: kses strips Substack's player iframes, so each one this can
+    // name becomes its provider URL alone in a paragraph, which WordPress's
+    // autoembed renders as the player. YouTube also matches a bare wrapper.
 
-    public function test_process_content_replaces_youtube_embed_with_linked_thumbnail(): void
+    public function test_process_content_replaces_youtube_embed_with_its_watch_url(): void
     {
         update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
 
@@ -281,9 +247,7 @@ class ReviewFixesTest extends TestCase
 
         $this->assertStringNotContainsString('youtube-wrap', $output, 'The stripped-iframe wrapper must not survive');
         $this->assertStringNotContainsString('<iframe', $output);
-        $this->assertStringContainsString('substack-video-embed', $output);
-        $this->assertStringContainsString('src="https://img.youtube.com/vi/KNFJSIj6xfQ/maxresdefault.jpg"', $output);
-        $this->assertStringContainsString('href="https://www.youtube.com/watch?v=KNFJSIj6xfQ"', $output);
+        $this->assertStringStartsWith('<p>https://www.youtube.com/watch?v=KNFJSIj6xfQ</p>', $output);
         $this->assertStringContainsString('<h1>Why this episode matters</h1>', $output, 'Body copy after the embed must survive');
     }
 
@@ -298,8 +262,7 @@ class ReviewFixesTest extends TestCase
             . '<iframe src="https://www.youtube-nocookie.com/embed/videoseries?list=PLp9pLaqAQe"></iframe></div>'
         );
 
-        $this->assertStringContainsString('vi/noBX7D2-7hA/maxresdefault.jpg', $output);
-        $this->assertStringContainsString('watch?v=noBX7D2-7hA', $output);
+        $this->assertStringContainsString('<p>https://www.youtube.com/watch?v=noBX7D2-7hA</p>', $output);
     }
 
     public function test_unparseable_youtube_wrapper_is_left_alone(): void
@@ -313,8 +276,7 @@ class ReviewFixesTest extends TestCase
             . '<iframe src="https://www.youtube-nocookie.com/embed/"></iframe></div>'
         );
 
-        $this->assertStringNotContainsString('substack-video-embed', $output);
-        $this->assertStringNotContainsString('img.youtube.com', $output);
+        $this->assertStringNotContainsString('youtube.com/watch', $output);
     }
 
     public function test_video_id_with_url_metacharacters_is_rejected(): void
@@ -328,45 +290,34 @@ class ReviewFixesTest extends TestCase
 
         // The wrapper passes through untouched (data-attrs and all); what must
         // not happen is a URL getting built out of that value.
-        $this->assertStringNotContainsString('substack-video-embed', $output);
-        $this->assertStringNotContainsString('img.youtube.com', $output);
         $this->assertStringNotContainsString('youtube.com/watch', $output);
+        $this->assertStringNotContainsString('<p>https://', $output);
     }
 
-    public function test_video_thumbnail_survives_kses_and_becomes_the_featured_image(): void
+    public function test_a_youtube_cover_becomes_the_full_size_frame(): void
     {
         global $_wp_sideload_calls, $_wp_thumbnails, $_wp_post_meta;
 
         update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
 
-        // Walk the real pipeline order: process_content(), then wp_kses_post()
-        // (which is what ate the original iframe), then image localization.
         $content = wp_kses_post($this->invokeProcessContent(
             '<div id="youtube2-KNFJSIj6xfQ" class="youtube-wrap" data-attrs="{&quot;videoId&quot;:&quot;KNFJSIj6xfQ&quot;}">'
             . '<iframe src="https://www.youtube-nocookie.com/embed/KNFJSIj6xfQ"></iframe></div>'
             . '<p>Body</p><img src="https://cdn.example.com/later-photo.jpg">'
         ));
 
-        // bootstrap.php stubs wp_kses_post() and keeps every attribute on an
-        // allowed tag, so this shows only that no disallowed TAG is emitted.
-        // figure/a/img and their attributes were checked against core's real
-        // $allowedposttags (wp-includes/kses.php) by hand.
-        $this->assertStringContainsString('img.youtube.com', $content, 'No disallowed tag in the replacement');
-
         $post_id = wp_insert_post(['post_title' => 'Video post', 'post_content' => $content, 'post_status' => 'publish']);
-        $this->invokeProcessPostImages($post_id, $content);
+        // The enclosure Substack gives a video-led post: its own 728px copy of the frame.
+        $localized = $this->invokeProcessPostImages($post_id, $content, 'https://substackcdn.com/image/youtube/w_728,c_limit/KNFJSIj6xfQ');
 
+        $this->assertContains('https://img.youtube.com/vi/KNFJSIj6xfQ/maxresdefault.jpg', $_wp_sideload_calls, 'The frame comes from YouTube at full size');
         $this->assertSame(
             'https://img.youtube.com/vi/KNFJSIj6xfQ/maxresdefault.jpg',
-            $_wp_sideload_calls[0] ?? null,
-            'The thumbnail must be sideloaded into the media library like any other image'
+            $_wp_post_meta[$_wp_thumbnails[$post_id] ?? 0]['_substack_sync_source_url'] ?? null,
+            'The cover wins the featured slot over the body photo'
         );
-        $this->assertArrayHasKey($post_id, $_wp_thumbnails, 'A video post must end up with a featured image');
-        $this->assertSame(
-            'https://img.youtube.com/vi/KNFJSIj6xfQ/maxresdefault.jpg',
-            $_wp_post_meta[$_wp_thumbnails[$post_id]]['_substack_sync_source_url'] ?? null,
-            'The embed leads the post, so the video frame wins the featured slot over the later body photo'
-        );
+        $this->assertStringContainsString('<p>https://www.youtube.com/watch?v=KNFJSIj6xfQ</p>', (string) $localized);
+        $this->assertStringContainsString('myblog.example.com/wp-content/uploads/', (string) $localized, 'The body photo is not the featured image, so it stays');
     }
 
     public function test_garbage_data_attrs_falls_through_to_the_element_id(): void
@@ -380,7 +331,7 @@ class ReviewFixesTest extends TestCase
             . '<iframe src="https://www.youtube-nocookie.com/embed/"></iframe></div>'
         );
 
-        $this->assertStringContainsString('vi/KNFJSIj6xfQ/maxresdefault.jpg', $output);
+        $this->assertStringContainsString('<p>https://www.youtube.com/watch?v=KNFJSIj6xfQ</p>', $output);
         $this->assertStringNotContainsString('evil', $output);
     }
 
@@ -395,8 +346,7 @@ class ReviewFixesTest extends TestCase
             . '<iframe src="https://www.youtube-nocookie.com/embed/videoseries?list=PLp9pLaqAQe"></iframe></div>'
         );
 
-        $this->assertStringNotContainsString('substack-video-embed', $output);
-        $this->assertStringNotContainsString('vi/videoseries/', $output);
+        $this->assertStringNotContainsString('youtube.com/watch', $output);
     }
 
     public function test_lookalike_embed_host_is_left_alone(): void
@@ -408,8 +358,7 @@ class ReviewFixesTest extends TestCase
             '<div class="youtube-wrap"><iframe src="https://evilyoutube.com/embed/KNFJSIj6xfQ"></iframe></div>'
         );
 
-        $this->assertStringNotContainsString('substack-video-embed', $output);
-        $this->assertStringNotContainsString('img.youtube.com', $output);
+        $this->assertStringNotContainsString('youtube.com/watch', $output);
     }
 
     public function test_embed_is_rewritten_without_a_substack_wrapper(): void
@@ -423,7 +372,7 @@ class ReviewFixesTest extends TestCase
             '<p>Intro</p><iframe src="https://www.youtube.com/embed/KNFJSIj6xfQ?rel=0"></iframe>'
         );
 
-        $this->assertStringContainsString('vi/KNFJSIj6xfQ/maxresdefault.jpg', $output);
+        $this->assertStringContainsString('<p>https://www.youtube.com/watch?v=KNFJSIj6xfQ</p>', $output);
         $this->assertStringNotContainsString('<iframe', $output);
         $this->assertStringContainsString('<p>Intro</p>', $output);
     }
@@ -432,9 +381,8 @@ class ReviewFixesTest extends TestCase
     {
         update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
 
-        // What get_content() actually returns for a video post: fetch_feed()
-        // sanitizes content:encoded with WP_SimplePie_Sanitize_KSES while
-        // parsing, so the iframe is already gone and only the wrapper arrives.
+        // What get_content() returns for a video post, fetch_feed() having
+        // sanitized content:encoded while parsing: the wrapper, no iframe.
         $output = $this->invokeProcessContent(
             '<div id="youtube2-noBX7D2-7hA" class="youtube-wrap"'
             . ' data-attrs="{&quot;videoId&quot;:&quot;noBX7D2-7hA&quot;,&quot;startTime&quot;:null}"'
@@ -444,9 +392,7 @@ class ReviewFixesTest extends TestCase
 
         $this->assertStringNotContainsString('youtube-wrap', $output, 'The emptied wrapper must not survive');
         $this->assertStringNotContainsString('youtube-inner', $output);
-        $this->assertStringContainsString('substack-video-embed', $output);
-        $this->assertStringContainsString('src="https://img.youtube.com/vi/noBX7D2-7hA/maxresdefault.jpg"', $output);
-        $this->assertStringContainsString('href="https://www.youtube.com/watch?v=noBX7D2-7hA"', $output);
+        $this->assertStringStartsWith('<p>https://www.youtube.com/watch?v=noBX7D2-7hA</p>', $output);
         $this->assertStringContainsString('<h1>The Episode Concept</h1>', $output, 'Body copy after the embed must survive');
     }
 
@@ -458,8 +404,7 @@ class ReviewFixesTest extends TestCase
         // is the only record of the video left in the content.
         $output = $this->invokeProcessContent('<div id="youtube2-KNFJSIj6xfQ" class="youtube-wrap"></div>');
 
-        $this->assertStringContainsString('vi/KNFJSIj6xfQ/maxresdefault.jpg', $output);
-        $this->assertStringContainsString('watch?v=KNFJSIj6xfQ', $output);
+        $this->assertSame('<p>https://www.youtube.com/watch?v=KNFJSIj6xfQ</p>', $output);
     }
 
     public function test_non_youtube_wrapper_carrying_a_video_id_is_left_alone(): void
@@ -476,76 +421,124 @@ class ReviewFixesTest extends TestCase
             . ' data-component-name="NativeVideoToDOM"></div>'
         );
 
-        $this->assertStringNotContainsString('substack-video-embed', $output);
-        $this->assertStringNotContainsString('img.youtube.com', $output);
+        $this->assertStringNotContainsString('youtube.com/watch', $output);
         $this->assertStringContainsString('native-video-embed', $output, 'The other embed must pass through untouched');
     }
 
-    public function test_wrapper_around_a_surviving_foreign_iframe_is_left_alone(): void
+    public function test_a_youtube_looking_wrapper_around_a_vimeo_player_stays_vimeo(): void
     {
         update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
 
-        // An iframe still standing is a live player. Replacing it on the
-        // strength of a videoId that YouTube never issued would trade a working
-        // embed for a 404 frame and a dead link.
+        // The iframe's host decides. Reading the wrapper's videoId as YouTube's
+        // would trade a working embed for a video YouTube never issued.
         $output = $this->invokeProcessContent(
             '<div class="youtube-wrap" data-attrs=\'{"videoId":"abcdefghijk"}\'>'
             . '<iframe src="https://player.vimeo.com/video/12345"></iframe></div>'
         );
 
-        $this->assertStringNotContainsString('substack-video-embed', $output);
-        $this->assertStringContainsString('player.vimeo.com', $output);
+        $this->assertSame('<p>https://vimeo.com/12345</p>', $output);
     }
 
-    public function test_foreign_iframe_carrying_the_wrapper_id_is_left_alone(): void
+    public function test_a_vimeo_player_carrying_the_wrapper_id_stays_vimeo(): void
     {
         update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
 
         // The wrapper signal on the iframe itself, with no wrapper div at all.
-        // A descendant-only guard reads this as "no iframe here" and replaces a
-        // live player with a frame for an ID YouTube never issued.
         $output = $this->invokeProcessContent(
             '<iframe id="youtube2-abcdefghijk" src="https://player.vimeo.com/video/12345"></iframe>'
         );
 
-        $this->assertStringNotContainsString('substack-video-embed', $output);
-        $this->assertStringNotContainsString('img.youtube.com', $output);
-        $this->assertStringContainsString('player.vimeo.com', $output);
+        $this->assertSame('<p>https://vimeo.com/12345</p>', $output);
     }
 
-    public function test_the_content_fetch_feed_delivers_wins_the_featured_slot(): void
+    public function test_spotify_and_unlisted_vimeo_players_become_their_urls(): void
     {
-        global $_wp_sideload_calls, $_wp_thumbnails, $_wp_post_meta;
-
         update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
 
-        // The whole production order, which is what an iframe-only match missed:
-        // sanitize on the way in (fetch_feed), then process_content(), then
-        // sanitize again (prepare_post_data), then localize images.
-        $delivered = wp_kses_post(
-            '<div id="youtube2-KNFJSIj6xfQ" class="youtube-wrap" data-attrs="{&quot;videoId&quot;:&quot;KNFJSIj6xfQ&quot;}"'
-            . ' data-component-name="Youtube2ToDOM"><div class="youtube-inner">'
-            . '<iframe src="https://www.youtube-nocookie.com/embed/KNFJSIj6xfQ"></iframe></div></div>'
-            . '<p>Body</p><img src="https://cdn.example.com/later-photo.jpg">'
+        // Verbatim Spotify shape from sovereigngrace.substack.com/feed: the iframe is the whole embed.
+        $output = $this->invokeProcessContent(
+            '<p>Click HERE to access the playlist</p><iframe class="spotify-wrap playlist"'
+            . ' data-attrs="{&quot;url&quot;:&quot;https://open.spotify.com/playlist/0KYSJUGP9PpWiR2tQKnuAt&quot;}"'
+            . ' src="https://open.spotify.com/embed/playlist/0KYSJUGP9PpWiR2tQKnuAt" data-component-name="Spotify2ToDOM"></iframe>'
+            . '<div class="vimeo-wrap"><iframe src="https://player.vimeo.com/video/76979871?h=8272103f6e&amp;autoplay=0"></iframe></div>'
         );
-
-        $this->assertStringNotContainsString('<iframe', $delivered, 'Sanitization on the way in eats the iframe');
-
-        $content = wp_kses_post($this->invokeProcessContent($delivered));
-        $post_id = wp_insert_post(['post_title' => 'Video post', 'post_content' => $content, 'post_status' => 'publish']);
-        $this->invokeProcessPostImages($post_id, $content);
 
         $this->assertSame(
-            'https://img.youtube.com/vi/KNFJSIj6xfQ/maxresdefault.jpg',
-            $_wp_sideload_calls[0] ?? null,
-            'The frame must be sideloaded from the wrapper the feed actually delivers'
+            '<p>Click HERE to access the playlist</p><p>https://open.spotify.com/playlist/0KYSJUGP9PpWiR2tQKnuAt</p>'
+            . '<p>https://vimeo.com/76979871/8272103f6e</p>',
+            $output
         );
-        $this->assertArrayHasKey($post_id, $_wp_thumbnails, 'A video post must end up with a featured image');
+    }
+
+    public function test_an_iframe_no_provider_claims_is_left_for_kses(): void
+    {
+        update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
+
+        $output = $this->invokeProcessContent(
+            '<iframe src="https://open.spotify.com/embed/playlist/not-an-id"></iframe>'
+            . '<iframe src="https://example.com/embed/player"></iframe>'
+        );
+
+        $this->assertStringNotContainsString('<p>https://', $output);
+        $this->assertStringNotContainsString('<iframe', wp_kses_post($output), 'kses still drops what nothing converted');
+    }
+
+    public function test_the_unsanitized_feed_item_is_what_gets_processed(): void
+    {
+        update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
+
+        // fetch_feed() hands get_content() back already kses'd, which takes a
+        // Spotify embed whole: the iframe is the embed. Only the raw item has it.
+        $raw = '<p>Listen</p><iframe src="https://open.spotify.com/embed/playlist/0KYSJUGP9PpWiR2tQKnuAt"></iframe>';
+        $item = new SimplePie_Item('Playlist', wp_kses_post($raw), 'guid-playlist', raw: $raw);
+
+        $post_data = $this->invokePreparePostData($item);
+
+        $this->assertSame('<p>Listen</p><p>https://open.spotify.com/playlist/0KYSJUGP9PpWiR2tQKnuAt</p>', $post_data['post_content']);
+    }
+
+    public function test_a_podcast_episode_leads_with_its_audio_and_a_video_episode_links_its_video(): void
+    {
+        update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
+
+        $audio = 'https://api.substack.com/feed/podcast/211893209/67519b40dd741520259bbd7f32e6c5dc.mp3';
+        $item = new SimplePie_Item(
+            'The Clash Vs. Busyness',
+            '<p>Show notes</p>',
+            'guid-busyness',
+            'https://example.substack.com/p/the-clash-vs-busyness',
+            enclosure: new SimplePie_Enclosure($audio, 'audio/mpeg')
+        );
+
+        $this->assertSame("[audio src=\"{$audio}\"]<p>Show notes</p>", $this->invokePreparePostData($item)['post_content']);
+
+        // Excerpts strip shortcodes and every block but text ones, so neither the
+        // player nor the link shows up on the post's card ahead of its show notes.
+        $processor = new Substack_Sync_Processor();
+        $header = (new ReflectionMethod($processor, 'podcast_header'))
+            ->invoke($processor, $item, ['bylines' => [], 'cover_image' => '', 'has_video' => true]);
         $this->assertSame(
-            'https://img.youtube.com/vi/KNFJSIj6xfQ/maxresdefault.jpg',
-            $_wp_post_meta[$_wp_thumbnails[$post_id]]['_substack_sync_source_url'] ?? null,
-            'The embed leads the post, so the video frame wins the featured slot over the later body photo'
+            "[audio src=\"{$audio}\"]"
+            . '<!-- wp:buttons --><div class="wp-block-buttons"><!-- wp:button --><div class="wp-block-button">'
+            . '<a class="wp-block-button__link wp-element-button" href="https://example.substack.com/p/the-clash-vs-busyness">Watch the video on Substack</a>'
+            . '</div><!-- /wp:button --></div><!-- /wp:buttons -->',
+            $header
         );
+    }
+
+    public function test_an_audio_url_that_could_break_out_of_its_paragraph_is_dropped(): void
+    {
+        update_option('substack_sync_settings', ['feed_url' => 'https://example.substack.com/feed']);
+
+        foreach ([
+            'https://api.substack.com/feed/x.mp3"><script>alert(1)</script>',
+            'https://evil.example.com/feed/podcast/1/x.mp3',
+            'http://api.substack.com/feed/podcast/1/x.mp3',
+        ] as $audio) {
+            $item = new SimplePie_Item('Episode', '<p>Notes</p>', 'guid-ep', enclosure: new SimplePie_Enclosure($audio, 'audio/mpeg'));
+
+            $this->assertSame('<p>Notes</p>', $this->invokePreparePostData($item)['post_content'], $audio);
+        }
     }
 
     // ---------------------------------------------------------------
@@ -1333,7 +1326,7 @@ class ReviewFixesTest extends TestCase
 
         $this->assertStringContainsString('Caption above the video', $output);
         $this->assertStringContainsString('<figcaption>Episode 12</figcaption>', $output);
-        $this->assertStringContainsString('vi/KNFJSIj6xfQ/maxresdefault.jpg', $output);
+        $this->assertStringContainsString('<p>https://www.youtube.com/watch?v=KNFJSIj6xfQ</p>', $output);
         $this->assertStringNotContainsString('youtube-wrap', $output);
         $this->assertStringNotContainsString('<iframe', $output);
     }
@@ -1344,15 +1337,13 @@ class ReviewFixesTest extends TestCase
 
         // A <p> between wrapper and iframe is still a pure wrapper, so the climb
         // continues through it. Stopping there would leave the aspect-ratio box
-        // standing empty and nest a <figure> inside a <p>.
+        // standing empty and nest the URL's paragraph inside another.
         $output = $this->invokeProcessContent(
             '<div class="youtube-wrap" style="padding-bottom:56.25%"><p>'
             . '<iframe src="https://www.youtube-nocookie.com/embed/KNFJSIj6xfQ"></iframe></p></div>'
         );
 
-        $this->assertStringContainsString('vi/KNFJSIj6xfQ/maxresdefault.jpg', $output);
-        $this->assertStringNotContainsString('padding-bottom', $output);
-        $this->assertStringNotContainsString('<p>', $output);
+        $this->assertSame('<p>https://www.youtube.com/watch?v=KNFJSIj6xfQ</p>', $output);
     }
 
     public function test_unrelated_wrapper_id_is_not_read_as_a_video_id(): void
@@ -1366,8 +1357,7 @@ class ReviewFixesTest extends TestCase
             '<div id="abcdefghijk"><iframe src="https://www.youtube.com/embed/KNFJSIj6xfQ"></iframe></div>'
         );
 
-        $this->assertStringContainsString('vi/KNFJSIj6xfQ/maxresdefault.jpg', $output);
-        $this->assertStringNotContainsString('abcdefghijk', $output);
+        $this->assertSame('<p>https://www.youtube.com/watch?v=KNFJSIj6xfQ</p>', $output);
     }
 
     public function test_youtube_frames_are_named_by_video_id_in_the_media_library(): void
@@ -1394,8 +1384,7 @@ class ReviewFixesTest extends TestCase
         global $_wp_sideload_calls, $_wp_sideload_fail, $_wp_thumbnails, $_wp_post_meta;
 
         // maxres exists only for videos uploaded above 720p; YouTube says so by
-        // 404ing. Without the retry those posts sideload nothing and keep the
-        // body photo the whole rewrite exists to displace.
+        // 404ing. Without the retry those posts would sideload no frame at all.
         $_wp_sideload_fail = ['maxresdefault.jpg'];
 
         $content = wp_kses_post($this->invokeProcessContent(
@@ -1405,16 +1394,16 @@ class ReviewFixesTest extends TestCase
         ));
 
         $post_id = wp_insert_post(['post_title' => 'Video post', 'post_content' => $content, 'post_status' => 'publish']);
-        $this->invokeProcessPostImages($post_id, $content);
+        $this->invokeProcessPostImages($post_id, $content, 'https://substackcdn.com/image/youtube/w_728,c_limit/KNFJSIj6xfQ');
 
         $this->assertSame(
             [
+                'https://cdn.example.com/later-photo.jpg',
                 'https://img.youtube.com/vi/KNFJSIj6xfQ/maxresdefault.jpg',
                 'https://img.youtube.com/vi/KNFJSIj6xfQ/hqdefault.jpg',
-                'https://cdn.example.com/later-photo.jpg',
             ],
             $_wp_sideload_calls,
-            'The 404 must be retried once at hqdefault, and must not consume the failure budget the body photo needs'
+            'The 404 must be retried once at hqdefault'
         );
 
         $this->assertArrayHasKey($post_id, $_wp_thumbnails, 'A video with no maxres frame still gets a featured image');
@@ -1460,18 +1449,16 @@ class ReviewFixesTest extends TestCase
         }
     }
 
-    public function test_the_thumbnail_asserts_no_dimensions_it_cannot_guarantee(): void
+    public function test_the_embed_paragraph_holds_nothing_but_the_url(): void
     {
-        // The markup is written before anything is fetched, and the frame is
-        // 1280x720 or, on the fallback, 480x360. Either hardcoded pair stretches
-        // the other.
+        // autoembed matches a paragraph whose only content is the URL, so any
+        // attribute, markup, or caption carried along would leave a bare link.
         $output = $this->invokeProcessContent(
-            '<div class="youtube-wrap"><iframe src="https://www.youtube-nocookie.com/embed/KNFJSIj6xfQ"></iframe></div>'
+            '<div class="youtube-wrap" style="padding-bottom:56%"><iframe width="728" height="409"'
+            . ' src="https://www.youtube-nocookie.com/embed/KNFJSIj6xfQ?rel=0&amp;start=30"></iframe></div>'
         );
 
-        $this->assertStringContainsString('vi/KNFJSIj6xfQ/maxresdefault.jpg', $output);
-        $this->assertStringNotContainsString('width=', $output);
-        $this->assertStringNotContainsString('height=', $output);
+        $this->assertSame('<p>https://www.youtube.com/watch?v=KNFJSIj6xfQ</p>', $output);
     }
 
     /**
@@ -1743,8 +1730,13 @@ class ReviewFixesTest extends TestCase
         $saved = get_post($post_id)->post_content;
         $this->assertStringNotContainsString('http://8.8.8.8/a.png', $saved, 'Content must be rewritten to the local copy');
         $this->assertStringNotContainsString('srcset', $saved, 'Remote srcset must be dropped or it overrides the localized src');
-        $this->assertSame(2, substr_count($saved, 'myblog.example.com/wp-content/uploads/'), 'Both images must serve locally');
         $this->assertArrayHasKey($post_id, $_wp_thumbnails, 'First localized image must become the featured image');
+        $this->assertStringNotContainsString(
+            wp_get_attachment_url($_wp_thumbnails[$post_id]),
+            $saved,
+            'The template shows the featured image above the body, so its body copy goes'
+        );
+        $this->assertSame(1, substr_count($saved, 'myblog.example.com/wp-content/uploads/'), 'The other image serves locally');
     }
 
     public function test_image_sideloads_are_deduped_across_runs(): void
@@ -1753,6 +1745,8 @@ class ReviewFixesTest extends TestCase
 
         $post_id = wp_insert_post(['post_title' => 'x', 'post_content' => 'p', 'post_status' => 'publish']);
         $content = '<p><img src="http://8.8.8.8/a.png"></p>';
+        // An editor's own featured image, so the body image stays in the body.
+        set_post_thumbnail($post_id, 999);
 
         $this->invokeProcessPostImages($post_id, $content);
         $first_run_calls = count($_wp_sideload_calls);
@@ -1834,14 +1828,15 @@ class ReviewFixesTest extends TestCase
         // no extension before the query string. media_sideload_image() rejects
         // these; the sideload must still succeed by sniffing the downloaded type.
         $src = 'https://images.unsplash.com/photo-1611463537830-69624771b809?fm=jpg&w=1080';
-        $this->invokeProcessPostImages($post_id, '<p><img src="' . $src . '"></p>');
+        $second = 'https://images.unsplash.com/photo-1654089669464-dcc57c490d2b?fm=jpg&w=1080';
+        $this->invokeProcessPostImages($post_id, '<p><img src="' . $src . '"></p><p><img src="' . $second . '"></p>');
 
-        $this->assertCount(1, $_wp_sideload_calls, 'The extension-less remote image must be fetched');
+        $this->assertCount(2, $_wp_sideload_calls, 'The extension-less remote images must be fetched');
         $this->assertArrayHasKey($post_id, $_wp_thumbnails, 'The sideloaded image must become the featured image');
 
         $saved = get_post($post_id)->post_content;
         $this->assertStringNotContainsString('images.unsplash.com', $saved, 'Content must be rewritten to the local copy');
-        $this->assertStringContainsString('myblog.example.com/wp-content/uploads/', $saved);
+        $this->assertSame(1, substr_count($saved, 'myblog.example.com/wp-content/uploads/'), 'The featured one leaves the body');
     }
 
     public function test_url_extension_fallback_when_bytes_are_unsniffable(): void
@@ -1857,7 +1852,7 @@ class ReviewFixesTest extends TestCase
 
         $this->assertNotNull($localized, 'A URL-extension fallback must still localize the image');
         $this->assertArrayHasKey($post_id, $_wp_thumbnails, 'The fallback-typed image must become the featured image');
-        $this->assertStringContainsString('myblog.example.com/wp-content/uploads/', get_post($post_id)->post_content);
+        $this->assertStringNotContainsString('8.8.8.8', get_post($post_id)->post_content);
     }
 
     public function test_unrecognized_image_is_skipped_without_a_thumbnail(): void
@@ -2238,9 +2233,10 @@ class ReviewFixesTest extends TestCase
             'post_status' => 'publish',
         ]);
 
+        set_post_thumbnail($post_id, 999);
         $processor = new Substack_Sync_Processor();
         $method = new ReflectionMethod($processor, 'process_post_images');
-        $localized = $method->invoke($processor, $post_id, '<p><img src="http://8.8.8.8/a.png"></p>');
+        $localized = $method->invoke($processor, $post_id, '<p><img src="http://8.8.8.8/a.png"></p>')['content'];
 
         $this->assertSame(
             'ORIGINAL',
@@ -2301,9 +2297,7 @@ class ReviewFixesTest extends TestCase
         $_wp_post_meta[500] = ['_substack_sync_source_url' => $src]; // prior sync recorded it
         $_wp_missing_attachments = [500];                            // but it was since deleted
 
-        $processor = new Substack_Sync_Processor();
-        $method = new ReflectionMethod($processor, 'process_post_images');
-        $localized = $method->invoke($processor, $post_id, '<p><img src="' . $src . '"></p>');
+        $localized = $this->invokeProcessPostImages($post_id, '<p><img src="' . $src . '"></p>');
 
         $this->assertArrayNotHasKey($post_id, $_wp_thumbnails, 'Featured image must not point at a since-deleted attachment');
         $this->assertNull($localized, 'Nothing should be rewritten when the only image resolves to no local URL');
@@ -2350,19 +2344,27 @@ class ReviewFixesTest extends TestCase
         return $method->invoke($processor, $content);
     }
 
-    private function invokeProcessPostImages(int $post_id, string $content): ?string
+    private function invokePreparePostData($item, ?array $substack = null): array
     {
         $processor = new Substack_Sync_Processor();
-        $method = new ReflectionMethod($processor, 'process_post_images');
-        $localized = $method->invoke($processor, $post_id, $content);
+        $method = new ReflectionMethod($processor, 'prepare_post_data');
 
-        // Mirror the production callers: process_post_images() localizes and
-        // returns the content; the caller performs the single write.
-        if ($localized !== null) {
-            wp_update_post(['ID' => $post_id, 'post_content' => $localized]);
+        return $method->invoke($processor, $item, $substack);
+    }
+
+    private function invokeProcessPostImages(int $post_id, string $content, string $cover_url = ''): ?string
+    {
+        $processor = new Substack_Sync_Processor();
+        $images = (new ReflectionMethod($processor, 'process_post_images'))->invoke($processor, $post_id, $content, $cover_url);
+
+        // Mirror the production callers: process_post_images() decides, and the
+        // caller commits the images and performs the post's single write.
+        (new ReflectionMethod($processor, 'write_images'))->invoke($processor, $post_id, $images);
+        if ($images['content'] !== null) {
+            wp_update_post(wp_slash(['ID' => $post_id, 'post_content' => $images['content']]));
         }
 
-        return $localized;
+        return $images['content'];
     }
 
     private function invokeIsSafeRemoteUrl(string $url): bool

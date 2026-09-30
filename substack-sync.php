@@ -5,8 +5,8 @@ declare(strict_types=1);
 /**
  * Plugin Name:       Substack Sync
  * Plugin URI:        https://www.christopherspenn.com/2025/08/substack-sync-for-wordpress/
- * Description:       Syncs a Substack RSS feed to your WordPress site, localizing images and rewriting YouTube embeds. A fork of Christopher S. Penn's Substack Sync.
- * Version:           1.3.3
+ * Description:       Syncs a Substack RSS feed to your WordPress site with its images, players, and authors, leaving posts edited in WordPress alone. A fork of Christopher S. Penn's Substack Sync.
+ * Version:           1.4.0
  * Author:            Christopher S. Penn
  * Author URI:        https://www.christopherspenn.com/
  * Fork Maintainer:   Noah Welch
@@ -26,7 +26,7 @@ if (! defined('WPINC')) {
 
 // Define Plugin Constants. The directory is guarded because the test suite
 // defines it before loading anything, and redefining it here would warn.
-define('SUBSTACK_SYNC_VERSION', '1.3.3');
+define('SUBSTACK_SYNC_VERSION', '1.4.0');
 defined('SUBSTACK_SYNC_PLUGIN_DIR') || define('SUBSTACK_SYNC_PLUGIN_DIR', plugin_dir_path(__FILE__));
 
 /**
@@ -58,6 +58,41 @@ require_once SUBSTACK_SYNC_PLUGIN_DIR . 'includes/class-substack-sync-processor.
 // Initialize the classes
 new Substack_Sync_Admin();
 new Substack_Sync_Cron();
+
+add_action('save_post_post', [Substack_Sync_Processor::class, 'record_wordpress_edit'], 10, 3);
+
+/**
+ * The Authors taxonomy the sync fills from Substack bylines.
+ */
+function substack_sync_register_byline_taxonomy(): void
+{
+    register_taxonomy(Substack_Sync_Processor::BYLINE_TAXONOMY, 'post', [
+        'labels' => [
+            'name' => 'Authors',
+            'singular_name' => 'Author',
+            'menu_name' => 'Authors',
+            'all_items' => 'All Authors',
+            'edit_item' => 'Edit Author',
+            'view_item' => 'View Author',
+            'update_item' => 'Update Author',
+            'add_new_item' => 'Add New Author',
+            'new_item_name' => 'New Author Name',
+            'search_items' => 'Search Authors',
+            'popular_items' => 'Popular Authors',
+            'separate_items_with_commas' => 'Separate authors with commas',
+            'add_or_remove_items' => 'Add or remove authors',
+            'choose_from_most_used' => 'Choose from the most used authors',
+            'not_found' => 'No authors found.',
+            'back_to_items' => '&larr; Go to Authors',
+        ],
+        'public' => true,
+        'hierarchical' => false,
+        'show_in_rest' => true,
+        'show_admin_column' => true,
+        'rewrite' => ['slug' => 'authors', 'with_front' => false],
+    ]);
+}
+add_action('init', 'substack_sync_register_byline_taxonomy');
 
 /**
  * One-time backfill of the Substack source-URL post meta for posts imported

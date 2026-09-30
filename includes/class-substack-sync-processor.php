@@ -34,6 +34,28 @@ class Substack_Sync_Processor
     private const ATTACHMENT_SOURCE_URL_META_KEY = '_substack_sync_source_url';
 
     /**
+     * Set when someone saves a synced post in WordPress. The sync then leaves
+     * the post alone instead of reverting the edit on its next hourly run.
+     */
+    private const EDITED_META_KEY = '_substack_sync_edited';
+
+    /**
+     * Holds each post's Substack bylines. A taxonomy, not the post author,
+     * because posts carry several bylines and a byline needs no login.
+     */
+    public const BYLINE_TAXONOMY = 'byline';
+
+    /**
+     * Transient prefix for a post's cached Substack API response.
+     */
+    private const SUBSTACK_POST_TRANSIENT_PREFIX = 'substack_sync_post_';
+
+    /**
+     * Private post-meta key holding the post's last good Substack API answer.
+     */
+    private const SUBSTACK_POST_META_KEY = '_substack_sync_api_post';
+
+    /**
      * Option flag marking the one-time source-URL backfill as complete.
      */
     private const SOURCE_URL_BACKFILL_OPTION = 'substack_sync_source_url_backfilled';
@@ -90,6 +112,12 @@ class Substack_Sync_Processor
     private const VIDEO_REWRITE_FIXED_VERSION = '1.3.2';
 
     /**
+     * First version registering BYLINE_TAXONOMY, whose archive URLs 404 until
+     * WordPress rebuilds its rewrite rules.
+     */
+    private const BYLINE_TAXONOMY_VERSION = '1.4.0';
+
+    /**
      * How many unrepaired post IDs the pass records when it gives up. Enough to
      * work through by hand; past that the list is a symptom, not a worklist.
      * The recorded count stays exact regardless.
@@ -104,11 +132,50 @@ class Substack_Sync_Processor
     private array $settings;
 
     /**
+     * True while the sync is writing a post, so record_wordpress_edit() can
+     * tell the plugin's own saves from a person's.
+     */
+    private static bool $writing = false;
+
+    /**
      * Initialize the class and set its properties.
      */
     public function __construct()
     {
         $this->settings = get_option('substack_sync_settings', []);
+    }
+
+    /**
+     * Hooked to save_post_post, which every editing path reaches: both editors,
+     * Quick and bulk edit, Elementor, REST. Revisions are their own post type.
+     */
+    public static function record_wordpress_edit(int $post_id, $post, bool $update): void
+    {
+        // Cron publishing a scheduled post changes only its status.
+        if (self::$writing || ! $update || doing_action('publish_future_post')) {
+            return;
+        }
+
+        // Only posts the sync manages carry a source URL.
+        if ((string) get_post_meta($post_id, self::SOURCE_URL_META_KEY, true) === '') {
+            return;
+        }
+
+        update_post_meta($post_id, self::EDITED_META_KEY, time());
+    }
+
+    public static function is_edited_in_wordpress(int $post_id): bool
+    {
+        return (string) get_post_meta($post_id, self::EDITED_META_KEY, true) !== '';
+    }
+
+    /**
+     * Hand an edited post back to the sync. Its next run replaces the post with
+     * the Substack version, which undoes whatever was edited here.
+     */
+    public static function resume_substack_updates(int $post_id): void
+    {
+        delete_post_meta($post_id, self::EDITED_META_KEY);
     }
 
     /**
@@ -278,8 +345,44 @@ class Substack_Sync_Processor
         $existing_post = $this->get_existing_post($guid);
         $post_title = $item->get_title() ?? '';
 
+        // An edit made in WordPress is the newer version, and the sync cannot
+        // merge it, so it neither fetches nor writes anything for that post.
+        if ($existing_post && self::is_edited_in_wordpress((int) $existing_post['post_id'])) {
+            if ($return_status) {
+                return [
+                    'action' => 'skipped',
+                    'post_title' => $post_title,
+                    'post_id' => $existing_post['post_id'],
+                    'success' => false,
+                    'message' => 'edited in WordPress',
+                ];
+            }
+
+            return;
+        }
+
+        self::$writing = true;
+
+        try {
+            return $this->write_feed_item($item, $existing_post, $post_title, $return_status);
+        } finally {
+            self::$writing = false;
+        }
+    }
+
+    /**
+     * The body of process_feed_item(): import or update the item's post.
+     * @return array<string, mixed>|void Status information if requested.
+     */
+    private function write_feed_item($item, ?array $existing_post, string $post_title, bool $return_status)
+    {
+        // Without an answer a video episode would be rewritten without its button,
+        // so an API outage reuses the post's last one, and only a new post has none.
+        $substack = $this->fetch_substack_post($item)
+            ?? ($existing_post ? $this->last_substack_post((int) $existing_post['post_id']) : null);
+
         if ($existing_post) {
-            $result = $this->update_post($item, $existing_post, $return_status);
+            $result = $this->update_post($item, $existing_post, $return_status, $substack);
 
             if ($return_status) {
                 return [
@@ -291,7 +394,7 @@ class Substack_Sync_Processor
                 ];
             }
         } else {
-            $result = $this->import_post($item, $return_status);
+            $result = $this->import_post($item, $return_status, $substack);
 
             if ($return_status) {
                 return [
@@ -532,11 +635,12 @@ class Substack_Sync_Processor
      *
      * @param SimplePie_Item $item The feed item to import.
      * @param bool $return_status Whether to return status information.
+     * @param array<string, mixed>|null $substack fetch_substack_post()'s answer.
      * @return array<string, mixed>|void Status information if requested.
      */
-    private function import_post($item, bool $return_status = false)
+    private function import_post($item, bool $return_status = false, ?array $substack = null)
     {
-        $post_data = $this->prepare_post_data($item);
+        $post_data = $this->prepare_post_data($item, $substack);
         $post_title = $post_data['post_title'];
         $guid = $item->get_id();
 
@@ -553,7 +657,9 @@ class Substack_Sync_Processor
             return;
         }
 
-        $post_id = wp_insert_post($post_data);
+        // Core's post and term writers unslash their input, as they would $_POST,
+        // so every write of feed text is slashed first or loses its backslashes.
+        $post_id = wp_insert_post(wp_slash($post_data));
 
         if ($post_id && ! is_wp_error($post_id)) {
             $this->log_sync($post_id, $guid, 'imported', $post_title);
@@ -562,9 +668,21 @@ class Substack_Sync_Processor
             // Imports need the post to exist before images can be sideloaded
             // (attachment parent + featured image), so this is the one path that
             // writes twice: insert, then a single update with localized content.
-            $localized = $this->process_post_images($post_id, $post_data['post_content']);
-            if ($localized !== null) {
-                wp_update_post(['ID' => $post_id, 'post_content' => $localized]);
+            $images = $this->process_post_images(
+                (int) $post_id,
+                $post_data['post_content'],
+                $this->cover_image_url($item, $substack)
+            );
+
+            // Someone can open a post seconds after its import, and their save wins.
+            if (! $this->edited_meanwhile((int) $post_id)) {
+                $this->write_images((int) $post_id, $images);
+                if ($images['content'] !== null) {
+                    wp_update_post(wp_slash(['ID' => $post_id, 'post_content' => $images['content']]));
+                }
+
+                $this->assign_bylines((int) $post_id, $item, $substack);
+                $this->remember_substack_post((int) $post_id, $substack);
             }
 
             if ($return_status) {
@@ -595,11 +713,12 @@ class Substack_Sync_Processor
      * @param SimplePie_Item $item The feed item.
      * @param array<string, mixed> $existing_post The existing post data.
      * @param bool $return_status Whether to return status information.
+     * @param array<string, mixed>|null $substack fetch_substack_post()'s answer.
      * @return array<string, mixed>|void Status information if requested.
      */
-    private function update_post($item, array $existing_post, bool $return_status = false)
+    private function update_post($item, array $existing_post, bool $return_status = false, ?array $substack = null)
     {
-        $post_data = $this->prepare_post_data($item);
+        $post_data = $this->prepare_post_data($item, $substack);
         $post_data['ID'] = $existing_post['post_id'];
         unset($post_data['post_status']);
         $post_title = $post_data['post_title'];
@@ -626,16 +745,37 @@ class Substack_Sync_Processor
         // every update regardless of whether any field changed. Suppressing that
         // would require a change-detection guard before the write, not just
         // matching content.)
-        $localized = $this->process_post_images((int) $post_data['ID'], $post_data['post_content']);
-        if ($localized !== null) {
-            $post_data['post_content'] = $localized;
+        $images = $this->process_post_images(
+            (int) $post_data['ID'],
+            $post_data['post_content'],
+            $this->cover_image_url($item, $substack)
+        );
+        if ($images['content'] !== null) {
+            $post_data['post_content'] = $images['content'];
         }
 
-        $post_id = wp_update_post($post_data);
+        // The fetches above can take seconds, and a save made meanwhile must win,
+        // featured image included, so nothing is written until this passes.
+        if ($this->edited_meanwhile((int) $post_data['ID'])) {
+            if ($return_status) {
+                return [
+                    'success' => false,
+                    'post_id' => $existing_post['post_id'],
+                    'message' => "Skipped: {$post_title} (edited in WordPress)",
+                ];
+            }
+
+            return;
+        }
+
+        $this->write_images((int) $post_data['ID'], $images);
+        $post_id = wp_update_post(wp_slash($post_data));
 
         if ($post_id && ! is_wp_error($post_id)) {
             $this->log_sync($post_id, $guid, 'updated', $post_title);
             $this->store_source_url((int) $post_id, $item);
+            $this->assign_bylines((int) $post_id, $item, $substack);
+            $this->remember_substack_post((int) $post_id, $substack);
 
             if ($return_status) {
                 return [
@@ -663,32 +803,30 @@ class Substack_Sync_Processor
      * Prepare post data for WordPress insertion.
      *
      * @param SimplePie_Item $item The feed item.
+     * @param array<string, mixed>|null $substack fetch_substack_post()'s answer.
      * @return array<string, mixed> Post data array.
      */
-    private function prepare_post_data($item): array
+    private function prepare_post_data($item, ?array $substack = null): array
     {
-        // SimplePie returns null (not '') for an item with no body/title, e.g. a
-        // link- or image-only Substack post. Coerce to '' so the strictly-typed
-        // process_content()/sanitize helpers below never receive null (a fatal
-        // TypeError under declare(strict_types=1)).
-        // Sanitize unconditionally with wp_kses_post so cron imports (user 0)
-        // and admin-triggered imports (an admin with unfiltered_html, for whom
-        // core skips kses) store the exact same content. Substack RSS is
-        // untrusted; this strips scripts and embeds on both paths alike.
-        $content = wp_kses_post($this->process_content($item->get_content() ?? ''));
+        // Sanitized unconditionally so cron imports (user 0) and an admin with
+        // unfiltered_html store the same content. Substack RSS is untrusted: this
+        // strips scripts, and any embed process_content() did not turn into a URL.
+        $content = wp_kses_post(
+            $this->podcast_header($item, $substack) . $this->process_content($this->raw_item_content($item))
+        );
+        // SimplePie returns null, not '', for an item with no title.
         $title = sanitize_text_field($item->get_title() ?? '');
 
         // Apply category mapping based on content and title
         $full_text = $title . ' ' . $content;
         $categories = $this->apply_category_mapping($full_text);
 
-        // A feed pubDate in the future makes wp_insert_post() silently flip
-        // post_status from the configured value to 'future' (scheduled),
-        // overriding the admin's Draft/Published choice. Cap it at "now" (and
-        // fall back to now when the feed omits a date) so the choice is honored.
-        $post_date = $item->get_date('Y-m-d H:i:s');
-        if (empty($post_date) || strtotime($post_date) > time()) {
-            $post_date = current_time('mysql');
+        // Given as GMT: a post_date alone is read as site-local time, which put a
+        // US site's posts hours ahead. A future date would make wp_insert_post()
+        // schedule the post over the configured status, so it is capped at now.
+        $post_date_gmt = (string) $item->get_gmdate('Y-m-d H:i:s');
+        if ($post_date_gmt === '' || strtotime($post_date_gmt . ' UTC') > time()) {
+            $post_date_gmt = gmdate('Y-m-d H:i:s');
         }
 
         $post_data = [
@@ -696,7 +834,8 @@ class Substack_Sync_Processor
             'post_content' => $content,
             'post_status' => $this->settings['default_post_status'] ?? 'draft',
             'post_author' => $this->settings['default_author'] ?? 1,
-            'post_date' => $post_date,
+            'post_date' => get_date_from_gmt($post_date_gmt),
+            'post_date_gmt' => $post_date_gmt,
             'post_type' => 'post',
         ];
 
@@ -709,6 +848,80 @@ class Substack_Sync_Processor
     }
 
     /**
+     * The item's content:encoded as Substack sent it. get_content() is what
+     * fetch_feed() already ran wp_kses_post() over, which drops every embed.
+     */
+    private function raw_item_content($item): string
+    {
+        $tags = $item->get_item_tags('http://purl.org/rss/1.0/modules/content/', 'encoded');
+        $raw = is_array($tags) ? ($tags[0]['data'] ?? null) : null;
+
+        return is_string($raw) && $raw !== '' ? $raw : (string) ($item->get_content() ?? '');
+    }
+
+    /**
+     * A podcast episode's audio, which the feed carries only as its enclosure, and
+     * a video episode's link: Substack's video has no player other sites can embed.
+     */
+    private function podcast_header($item, ?array $substack): string
+    {
+        $audio = $this->enclosure_url($item, 'audio/');
+        $host = strtolower((string) wp_parse_url($audio, PHP_URL_HOST));
+        $feed_host = strtolower((string) wp_parse_url((string) ($this->settings['feed_url'] ?? ''), PHP_URL_HOST));
+
+        // Strict, because the URL is written into a shortcode attribute verbatim.
+        if (
+            ! in_array($host, ['api.substack.com', $feed_host], true)
+            || ! preg_match('#^https://[^/]+/[A-Za-z0-9/_.-]+\.(mp3|m4a)$#', $audio)
+        ) {
+            return '';
+        }
+
+        // A shortcode and a button block, not text: excerpts strip both, so the
+        // post's card still opens on its show notes.
+        $header = '[audio src="' . $audio . '"]';
+
+        if ($substack !== null && $substack['has_video']) {
+            $link = esc_url_raw((string) $item->get_permalink());
+            if ($link !== '') {
+                $header .= '<!-- wp:buttons --><div class="wp-block-buttons"><!-- wp:button --><div class="wp-block-button">'
+                    . '<a class="wp-block-button__link wp-element-button" href="' . esc_attr($link) . '">Watch the video on Substack</a>'
+                    . '</div><!-- /wp:button --></div><!-- /wp:buttons -->';
+            }
+        }
+
+        return $header;
+    }
+
+    /**
+     * The feed item's enclosure URL when its MIME type starts with $type_prefix.
+     */
+    private function enclosure_url($item, string $type_prefix): string
+    {
+        $enclosure = $item->get_enclosure();
+        if (! is_object($enclosure)) {
+            return '';
+        }
+
+        $type = strtolower((string) $enclosure->get_type());
+
+        return str_starts_with($type, $type_prefix) ? (string) $enclosure->get_link() : '';
+    }
+
+    /**
+     * The image Substack shows for the post. The API's cover is the only one a
+     * podcast episode has; for everything else the feed's image enclosure is it.
+     */
+    private function cover_image_url($item, ?array $substack): string
+    {
+        if ($substack !== null && $substack['cover_image'] !== '') {
+            return $substack['cover_image'];
+        }
+
+        return $this->enclosure_url($item, 'image/');
+    }
+
+    /**
      * Process and clean content from Substack.
      *
      * @param string $content The raw content from Substack.
@@ -717,13 +930,13 @@ class Substack_Sync_Processor
     private function process_content(string $content): string
     {
         // Cheap pre-check so untouched posts skip the DOM round-trip entirely.
-        // The video test is the bare host word, not a wrapper class, because the
-        // rewrite below keys on the embed URL; a prose mention of YouTube costs
-        // one wasted round-trip, which beats missing a real embed.
+        // "youtube" is the bare word because the wrapper pass below needs no
+        // iframe; a prose mention costs one wasted round-trip, not a lost embed.
         if (
             stripos($content, 'subscription') === false
             && stripos($content, 'like-button') === false
             && stripos($content, 'youtube') === false
+            && stripos($content, '<iframe') === false
         ) {
             return $content;
         }
@@ -758,31 +971,17 @@ class Substack_Sync_Processor
             }
         }
 
-        // Substack embeds video as an <iframe> inside a wrapper div, and the
-        // iframe never reaches WordPress: it is not an allowed post tag, so kses
-        // strips it and leaves the empty wrapper with no image at all. Swap in a
-        // linked thumbnail, which survives kses and is sideloaded by
-        // process_post_images() like any other image.
-        //
-        // Two passes, because on an imported post the strip already happened:
-        // fetch_feed() sanitizes with WP_SimplePie_Sanitize_KSES, which runs
-        // wp_kses_post() over content:encoded while parsing, so get_content()
-        // hands this method the wrapper alone. An iframe survives only for a
-        // caller holding unsanitized feed HTML. Match on the embed host where
-        // there is one, and on the wrapper below where there is not.
+        // Substack embeds players as iframes, which kses strips. Each one this
+        // can name becomes its provider URL on a line of its own, which WordPress
+        // turns back into the player when the post renders.
         foreach ($xpath->query('//iframe[@src]') as $iframe) {
             if (! $iframe instanceof DOMElement || ! $this->is_attached($iframe)) {
                 continue;
             }
 
-            $src = $iframe->getAttribute('src');
-            if (! $this->is_youtube_embed_src($src)) {
-                continue;
-            }
-
-            $chain = $this->youtube_embed_chain($iframe, $wrapper);
-            $video_id = $this->youtube_id_from_embed($chain, $src);
-            if ($video_id === null) {
+            $chain = $this->embed_chain($iframe, $wrapper);
+            $url = $this->embed_url($iframe->getAttribute('src'), $chain);
+            if ($url === null) {
                 continue;
             }
 
@@ -790,14 +989,12 @@ class Substack_Sync_Processor
             // Substack's padding-bottom aspect-ratio hack, and `style` survives
             // kses, so swapping only the iframe leaves a tall empty box.
             $target = end($chain);
-            $target->parentNode->replaceChild($this->build_video_thumbnail_node($doc, $video_id), $target);
+            $target->parentNode->replaceChild($this->build_embed_url_node($doc, $url), $target);
         }
 
-        // The pass that actually fires on an imported post: the iframe is gone
-        // before the item reaches process_content(), so the wrapper's own
-        // attributes are the only record of the video left. Selected on the two
-        // attributes an ID can be read from, since a wrapper matched on nothing
-        // else could never yield one.
+        // A YouTube wrapper whose iframe is already gone, as in content fetch_feed()
+        // sanitized: its own attributes are the only record of the video left, so
+        // it is selected on the two an ID can be read from.
         $wrappers = $xpath->query('//*[contains(@data-attrs, "videoId")] | //*[starts-with(@id, "youtube")]');
 
         foreach ($wrappers as $node) {
@@ -822,14 +1019,17 @@ class Substack_Sync_Processor
                 continue;
             }
 
-            $chain = $this->youtube_embed_chain($node, $wrapper);
+            $chain = $this->embed_chain($node, $wrapper);
             $video_id = $this->youtube_id_from_embed($chain);
             if ($video_id === null) {
                 continue;
             }
 
             $target = end($chain);
-            $target->parentNode->replaceChild($this->build_video_thumbnail_node($doc, $video_id), $target);
+            $target->parentNode->replaceChild(
+                $this->build_embed_url_node($doc, $this->youtube_watch_url($video_id)),
+                $target
+            );
         }
 
         $html = '';
@@ -957,7 +1157,7 @@ class Substack_Sync_Processor
      * @param DOMElement $boundary The document wrapper, never crossed.
      * @return list<DOMElement> The iframe and its wrapper ancestors.
      */
-    private function youtube_embed_chain(DOMElement $iframe, DOMElement $boundary): array
+    private function embed_chain(DOMElement $iframe, DOMElement $boundary): array
     {
         $chain = [$iframe];
         $node = $iframe;
@@ -1066,20 +1266,8 @@ class Substack_Sync_Processor
     }
 
     /**
-     * The poster-frame URL for a video ID.
-     *
-     * Shared by the rewrite and by repair_video_featured_images(), which has to
-     * recognize a URL this produced earlier; they must not drift apart. It stays
-     * the identity of the frame even when the bytes come from the fallback: the
-     * source-URL meta records what was asked for, not what answered.
-     *
-     * maxresdefault is 1280x720. hqdefault is 480x360, a 4:3 box, so a 16:9
-     * video comes back letterboxed with roughly a quarter of the image as black
-     * bars, and those bars land in the featured slot. maxres exists only for
-     * videos uploaded above 720p, hence youtube_thumbnail_fallback_url().
-     *
-     * @param string $video_id A validated YouTube video ID.
-     * @return string The thumbnail URL.
+     * A video's 1280x720 frame; hqdefault is letterboxed 4:3, so only a fallback.
+     * Covers download from this URL and the repair matches on it: keep them one.
      */
     private function youtube_thumbnail_url(string $video_id): string
     {
@@ -1126,37 +1314,55 @@ class Substack_Sync_Processor
         return $this->youtube_thumbnail_fallback_url($matches[1]);
     }
 
-    /**
-     * Build the linked-thumbnail replacement for a stripped video embed.
-     *
-     * Built as DOM nodes for the same reason build_subscribe_node() is: the URL
-     * is attribute-set verbatim and never run through a regex engine.
-     *
-     * @param DOMDocument $doc The document to create the node in.
-     * @param string $video_id A validated YouTube video ID.
-     * @return DOMElement The thumbnail block.
-     */
-    private function build_video_thumbnail_node(DOMDocument $doc, string $video_id): DOMElement
+    private function youtube_watch_url(string $video_id): string
     {
-        $figure = $doc->createElement('figure');
-        $figure->setAttribute('class', 'substack-video-embed');
+        return 'https://www.youtube.com/watch?v=' . $video_id;
+    }
 
-        $link = $doc->createElement('a');
-        $link->setAttribute('href', 'https://www.youtube.com/watch?v=' . $video_id);
-        $link->setAttribute('target', '_blank');
-        $link->setAttribute('rel', 'noopener noreferrer');
+    /**
+     * The provider URL for an embed iframe WordPress can play, or null. These are
+     * the players Substack's editor offers that core also has oEmbed support for.
+     */
+    private function embed_url(string $src, array $chain): ?string
+    {
+        if ($this->is_youtube_embed_src($src)) {
+            $video_id = $this->youtube_id_from_embed($chain, $src);
 
-        // No width/height: this markup is written before anything is fetched,
-        // and the frame is 1280x720 or, when maxres 404s and the sideload falls
-        // back, 480x360. Asserting either one here would stretch the other.
-        $img = $doc->createElement('img');
-        $img->setAttribute('src', $this->youtube_thumbnail_url($video_id));
-        $img->setAttribute('alt', 'Watch the video on YouTube');
+            return $video_id === null ? null : $this->youtube_watch_url($video_id);
+        }
 
-        $link->appendChild($img);
-        $figure->appendChild($link);
+        $host = strtolower((string) wp_parse_url($src, PHP_URL_HOST));
+        $path = (string) wp_parse_url($src, PHP_URL_PATH);
 
-        return $figure;
+        // Every piece of the URL is matched, not copied, so no feed value reaches it.
+        $spotify = '#^/embed/(track|album|playlist|episode|show|artist)/([A-Za-z0-9]{22})/?$#';
+        if ($host === 'open.spotify.com' && preg_match($spotify, $path, $matches)) {
+            return 'https://open.spotify.com/' . $matches[1] . '/' . $matches[2];
+        }
+
+        if ($host === 'player.vimeo.com' && preg_match('#^/video/(\d+)/?$#', $path, $matches)) {
+            // An unlisted video only plays with its privacy hash.
+            parse_str((string) wp_parse_url($src, PHP_URL_QUERY), $query);
+            $hash = is_string($query['h'] ?? null) && preg_match('/^[0-9a-f]+$/', $query['h']) === 1
+                ? '/' . $query['h']
+                : '';
+
+            return 'https://vimeo.com/' . $matches[1] . $hash;
+        }
+
+        return null;
+    }
+
+    /**
+     * An embed's replacement: its URL alone in a paragraph, which WordPress's
+     * autoembed turns into the provider's player when the post renders.
+     */
+    private function build_embed_url_node(DOMDocument $doc, string $url): DOMElement
+    {
+        $paragraph = $doc->createElement('p');
+        $paragraph->appendChild($doc->createTextNode($url));
+
+        return $paragraph;
     }
 
     /**
@@ -1180,52 +1386,36 @@ class Substack_Sync_Processor
     }
 
     /**
-     * Sideload remote images and return content rewritten to the local copies.
-     *
-     * Sideloads (deduped by source URL) and sets the featured image as side
-     * effects, but does NOT write the post: it returns the localized HTML so the
-     * caller folds it into a single wp_update_post(). Localizing before the
-     * caller's only write means an unchanged hourly sync produces content
-     * identical to what is stored, so WordPress creates no new revision. Writing
-     * here separately (as an earlier version did) doubled revisions on every
-     * image post, every hour, forever. (This does not stop post_modified from
-     * being bumped: wp_insert_post() sets it on every update regardless.)
-     *
-     * @param int $post_id The WordPress post ID.
-     * @param string $content The post content.
-     * @return string|null The localized content, or null when nothing was rewritten.
+     * Localize images and decide the featured image, writing none of it to the post;
+     * write_images() and the caller commit it once their edit check passes.
      */
-    private function process_post_images(int $post_id, string $content): ?string
+    private function process_post_images(int $post_id, string $content, string $cover_url = ''): array
     {
-        if (trim($content) === '' || stripos($content, '<img') === false) {
-            return null;
+        $unchanged = ['content' => null, 'thumbnail' => 0, 'captions' => []];
+        $has_images = trim($content) !== '' && stripos($content, '<img') !== false;
+        if (! $has_images && $cover_url === '') {
+            return $unchanged;
         }
 
-        // media_sideload_image() and its helpers live in wp-admin/includes and
-        // are NOT autoloaded on the cron (wp-cron.php) or admin-ajax paths, so
-        // the call would be an undefined-function fatal without these requires.
+        // The sideload helpers are not autoloaded on the cron or admin-ajax paths.
         require_once ABSPATH . 'wp-admin/includes/media.php';
         require_once ABSPATH . 'wp-admin/includes/file.php';
         require_once ABSPATH . 'wp-admin/includes/image.php';
 
         $doc = new DOMDocument();
-        $loaded = @$doc->loadHTML(
+        $loaded = $has_images && @$doc->loadHTML(
             '<?xml encoding="utf-8"?><div>' . $this->encode_stray_lt($content) . '</div>',
             LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD
         );
-        $wrapper = $doc->documentElement;
-
-        if (! $loaded || ! $wrapper instanceof DOMElement) {
-            return null;
-        }
+        $wrapper = $loaded && $doc->documentElement instanceof DOMElement ? $doc->documentElement : null;
 
         $home_host = strtolower((string) wp_parse_url(home_url(), PHP_URL_HOST));
-        $failed_downloads = 0;
-        $new_downloads = 0;
+        $budget = ['new' => 0, 'failed' => 0];
+        $images = [];
         $rewritten = 0;
         $first_attachment = 0;
 
-        foreach ($doc->getElementsByTagName('img') as $img) {
+        foreach ($wrapper ? $doc->getElementsByTagName('img') : [] as $img) {
             $src = $img->getAttribute('src');
             if (empty($src) || ! filter_var($src, FILTER_VALIDATE_URL)) {
                 continue;
@@ -1237,79 +1427,283 @@ class Substack_Sync_Processor
                 continue;
             }
 
-            // One download per source URL, ever: syncs run hourly, and without
-            // this the same image would re-enter the media library every run.
-            $attachment_id = $this->find_attachment_by_source($src);
+            $attachment_id = $this->attachment_for($src, $post_id, $budget);
+            $images[] = ['node' => $img, 'attachment' => $attachment_id, 'identity' => $this->image_identity($src)];
 
-            if (! $attachment_id) {
-                // Each sideload is a synchronous remote HTTP fetch inside the
-                // sync request. A max_execution_time kill mid-loop is not a
-                // Throwable, so no catch block can save the run; bound the
-                // per-run work in both directions. Skipped images are retried
-                // on later runs, so localization converges incrementally.
-                if ($failed_downloads >= 5 || $new_downloads >= 10) {
-                    continue;
-                }
-
-                // Feed content is attacker-influenced. filter_var only checks
-                // URL syntax, so an <img src="http://169.254.169.254/..."> or
-                // an RFC1918/loopback target would otherwise be fetched
-                // server-side (SSRF). Only sideload from public http(s) hosts.
-                if (! $this->is_safe_remote_url($src)) {
-                    error_log('Substack Sync: skipped unsafe image URL - ' . $src);
-
-                    continue;
-                }
-
-                $new_downloads++;
-                $result = $this->sideload_remote_image($src, $post_id);
-
-                if (is_wp_error($result)) {
-                    $failed_downloads++;
-                    error_log('Substack Sync: image sideload failed - ' . $result->get_error_message());
-
-                    continue;
-                }
-
-                $attachment_id = (int) $result;
-                update_post_meta($attachment_id, self::ATTACHMENT_SOURCE_URL_META_KEY, $src);
-            }
-
-            // Serve the local copy: without this rewrite the sideloaded files
-            // were never referenced, and posts kept hotlinking Substack's CDN.
-            $local_url = wp_get_attachment_url($attachment_id);
+            // Falsy for a dedup hit whose attachment was since deleted, which must
+            // neither be served nor become the featured image.
+            $local_url = $attachment_id ? wp_get_attachment_url($attachment_id) : false;
             if ($local_url) {
                 $img->setAttribute('src', $local_url);
-                // A leftover remote srcset would make browsers ignore the
-                // localized src.
+                // A leftover remote srcset would make browsers ignore the local src.
                 $img->removeAttribute('srcset');
                 $img->removeAttribute('sizes');
                 $rewritten++;
-
-                // Only inside this block: a dedup hit against a source-URL meta
-                // row whose attachment was since deleted returns a falsy URL,
-                // and setting that as the featured image would point the
-                // thumbnail at a nonexistent attachment.
-                if (! $first_attachment) {
-                    $first_attachment = $attachment_id;
-                }
+                $first_attachment = $first_attachment ?: $attachment_id;
             }
         }
 
-        if ($first_attachment && ! has_post_thumbnail($post_id)) {
-            set_post_thumbnail($post_id, $first_attachment);
-        }
+        // This read only spares downloading a cover that could not be used. The
+        // decision reads again once the downloads are done, uncached, so a featured
+        // image someone set meanwhile counts as theirs.
+        $cover = $this->thumbnail_is_replaceable((int) get_post_thumbnail_id($post_id))
+            ? $this->cover_attachment($cover_url, $images, $post_id, $budget)
+            : 0;
+        wp_cache_delete($post_id, 'post_meta');
+        $current = (int) get_post_thumbnail_id($post_id);
 
-        if ($rewritten > 0) {
+        // A cover may replace an image the plugin chose, never anyone else's; the
+        // first-image fallback only fills an empty slot, as it always has.
+        $cover = $cover && $this->thumbnail_is_replaceable($current) ? $cover : 0;
+        $desired = $cover ?: ($current <= 0 ? $first_attachment : 0);
+
+        $removed = $this->remove_featured_copies($images, $desired ?: $current, $wrapper);
+        $html = null;
+        if ($rewritten + $removed['count'] > 0) {
             $html = '';
             foreach ($wrapper->childNodes as $child) {
                 $html .= $doc->saveHTML($child);
             }
-
-            return $html;
         }
 
-        return null;
+        return [
+            'content' => $html,
+            'thumbnail' => $desired !== $current ? $desired : 0,
+            'captions' => $removed['captions'],
+        ];
+    }
+
+    /**
+     * Commit the featured image and captions process_post_images() decided on.
+     * @param array{content: ?string, thumbnail: int, captions: array<int, string>} $images
+     */
+    private function write_images(int $post_id, array $images): void
+    {
+        if ($images['thumbnail'] > 0) {
+            set_post_thumbnail($post_id, $images['thumbnail']);
+        }
+
+        foreach ($images['captions'] as $attachment_id => $caption) {
+            wp_update_post(wp_slash(['ID' => $attachment_id, 'post_excerpt' => $caption]));
+        }
+    }
+
+    /**
+     * Whether someone saved the post while the sync was fetching for it. Uncached:
+     * this request cached the post's meta before the seconds of fetching began.
+     */
+    private function edited_meanwhile(int $post_id): bool
+    {
+        wp_cache_delete($post_id, 'post_meta');
+
+        return self::is_edited_in_wordpress($post_id);
+    }
+
+    /**
+     * The attachment for a remote image, sideloading it at most once ever.
+     * 0 when it cannot be had this run; a later sync retries it.
+     */
+    private function attachment_for(string $src, int $post_id, array &$budget): int
+    {
+        $attachment_id = $this->find_attachment_by_source($src);
+        if ($attachment_id) {
+            return $attachment_id;
+        }
+
+        // Each sideload is a synchronous fetch inside the sync request, and a
+        // max_execution_time kill is no Throwable, so the work is bounded per run.
+        if ($budget['failed'] >= 5 || $budget['new'] >= 10) {
+            return 0;
+        }
+
+        // Feed content is attacker-influenced: fetch only public http(s) hosts.
+        if (! $this->is_safe_remote_url($src)) {
+            error_log('Substack Sync: skipped unsafe image URL - ' . $src);
+
+            return 0;
+        }
+
+        $budget['new']++;
+        $result = $this->sideload_remote_image($src, $post_id);
+
+        if (is_wp_error($result)) {
+            $budget['failed']++;
+            error_log('Substack Sync: image sideload failed - ' . $result->get_error_message());
+
+            return 0;
+        }
+
+        update_post_meta((int) $result, self::ATTACHMENT_SOURCE_URL_META_KEY, $src);
+
+        return (int) $result;
+    }
+
+    /**
+     * The attachment for the post's cover: the body's copy when there is one,
+     * so one picture never lands in the library twice, and otherwise its own.
+     */
+    private function cover_attachment(string $cover_url, array $images, int $post_id, array &$budget): int
+    {
+        if ($cover_url === '') {
+            return 0;
+        }
+
+        $identity = $this->image_identity($cover_url);
+        foreach ($images as $image) {
+            if ($image['identity'] === $identity) {
+                return $image['attachment'];
+            }
+        }
+
+        // Substack's resized copy of a YouTube frame is fetched from YouTube at
+        // full size, under the URL earlier versions sideloaded video frames from.
+        if (str_starts_with($identity, 'youtube:')) {
+            $cover_url = $this->youtube_thumbnail_url(substr($identity, strlen('youtube:')));
+        }
+
+        if (! filter_var($cover_url, FILTER_VALIDATE_URL)) {
+            return 0;
+        }
+
+        return $this->attachment_for($cover_url, $post_id, $budget);
+    }
+
+    /**
+     * Remove the featured image's copies from the body, matched on attachment or on its
+     * picture. Returns how many, and their captions keyed by the attachment to get each.
+     */
+    private function remove_featured_copies(array $images, int $featured, ?DOMElement $wrapper): array
+    {
+        $removed = ['count' => 0, 'captions' => []];
+        if ($featured <= 0 || $wrapper === null) {
+            return $removed;
+        }
+
+        $source = (string) get_post_meta($featured, self::ATTACHMENT_SOURCE_URL_META_KEY, true);
+        $identity = $source !== '' ? $this->image_identity($source) : '';
+
+        foreach ($images as $image) {
+            $copy = $image['attachment'] === $featured || ($identity !== '' && $image['identity'] === $identity);
+            if (! $copy || ! $this->is_attached($image['node'])) {
+                continue;
+            }
+
+            $caption = $this->remove_image_node($image['node'], $wrapper);
+            $removed['count']++;
+
+            // The caption leaves the body with its image, so it goes on the attachment,
+            // where the template's featured image can show it. Never over one set there.
+            if ($caption !== '' && (string) get_post_field('post_excerpt', $featured) === '') {
+                $removed['captions'][$featured] = $caption;
+            }
+        }
+
+        return $removed;
+    }
+
+    /**
+     * Remove an image with the markup that only holds it (Substack's captioned-image-
+     * container, or ancestors wrapping nothing else) and return its caption.
+     */
+    private function remove_image_node(DOMElement $img, DOMElement $boundary): string
+    {
+        $target = null;
+        for ($node = $img->parentNode; $node instanceof DOMElement && $node !== $boundary; $node = $node->parentNode) {
+            $class = $node->getAttribute('class');
+            $container = preg_match('/(?<![-\w])captioned-image-container(?![-\w])/', $class) === 1;
+            if ($container && $node->getElementsByTagName('img')->length === 1) {
+                $target = $node;
+
+                break;
+            }
+        }
+
+        if ($target === null) {
+            $target = $img;
+            while (
+                $target->parentNode instanceof DOMElement
+                && $target->parentNode !== $boundary
+                && $this->wraps_only($target->parentNode, $target)
+            ) {
+                $target = $target->parentNode;
+            }
+        }
+
+        $figcaption = $target->getElementsByTagName('figcaption')->item(0);
+        $caption = $figcaption instanceof DOMElement ? trim($figcaption->textContent) : '';
+
+        $paragraph = $this->caption_paragraph_after($target);
+        if ($paragraph !== null) {
+            $caption = $caption !== '' ? $caption : trim($paragraph->textContent);
+            $paragraph->parentNode->removeChild($paragraph);
+        }
+
+        $target->parentNode->removeChild($target);
+
+        return $caption;
+    }
+
+    /**
+     * The paragraph right after $node when it reads as a caption, centered and all
+     * emphasis, which is how this publication captions some of its images.
+     */
+    private function caption_paragraph_after(DOMNode $node): ?DOMElement
+    {
+        $next = $node->nextSibling;
+        while ($next instanceof DOMText && trim($next->wholeText) === '') {
+            $next = $next->nextSibling;
+        }
+
+        if (
+            ! $next instanceof DOMElement
+            || $next->nodeName !== 'p'
+            || preg_match('/text-align\s*:\s*center/i', $next->getAttribute('style')) !== 1
+        ) {
+            return null;
+        }
+
+        $emphasis = '';
+        foreach ($next->childNodes as $child) {
+            if ($child instanceof DOMText && trim($child->wholeText) === '') {
+                continue;
+            }
+
+            if (! $child instanceof DOMElement || ! in_array($child->nodeName, ['em', 'i'], true)) {
+                return null;
+            }
+
+            $emphasis .= $child->textContent;
+        }
+
+        return trim($emphasis) !== '' ? $next : null;
+    }
+
+    /**
+     * A key two URLs for one picture share. Substack's CDN wraps an upload in
+     * per-use resize parameters around the original; a frame is its video.
+     */
+    private function image_identity(string $url): string
+    {
+        $host = strtolower((string) wp_parse_url($url, PHP_URL_HOST));
+        $path = (string) wp_parse_url($url, PHP_URL_PATH);
+
+        if ($host === 'substackcdn.com') {
+            if (preg_match('#^/image/youtube/[^/]+/([A-Za-z0-9_-]{11})$#', $path, $matches)) {
+                return 'youtube:' . $matches[1];
+            }
+
+            if (preg_match('#^/image/fetch/[^/]+/(https?(?::|%3A).+)$#i', $path, $matches)) {
+                $origin = rawurldecode($matches[1]);
+                $host = strtolower((string) wp_parse_url($origin, PHP_URL_HOST));
+                $path = (string) wp_parse_url($origin, PHP_URL_PATH);
+            }
+        }
+
+        if ($host === 'img.youtube.com' && preg_match('#^/vi/([A-Za-z0-9_-]{11})/#', $path, $matches)) {
+            return 'youtube:' . $matches[1];
+        }
+
+        return $host === '' ? '' : $host . $path;
     }
 
     /**
@@ -1555,6 +1949,126 @@ class Substack_Sync_Processor
     }
 
     /**
+     * Substack's post API: all bylines, a podcast's cover, whether there is video.
+     * Undocumented, so null means no answer. Cached 12h per post, failures 1h.
+     */
+    private function fetch_substack_post($item): ?array
+    {
+        $url = $this->substack_post_api_url((string) $item->get_permalink());
+        if ($url === '') {
+            return null;
+        }
+
+        $key = self::SUBSTACK_POST_TRANSIENT_PREFIX . md5($url);
+        $cached = get_transient($key);
+        if (is_array($cached)) {
+            return $cached['post'] ?? null;
+        }
+
+        $response = wp_safe_remote_get($url, ['timeout' => 10]);
+        $post = null;
+
+        if (! is_wp_error($response) && (int) wp_remote_retrieve_response_code($response) === 200) {
+            $data = json_decode((string) wp_remote_retrieve_body($response), true);
+            $post = is_array($data) ? $this->normalize_substack_post($data) : null;
+        }
+
+        set_transient($key, ['post' => $post], $post === null ? HOUR_IN_SECONDS : 12 * HOUR_IN_SECONDS);
+
+        return $post;
+    }
+
+    /**
+     * The API answer the post was last synced with, or null when it has none.
+     */
+    private function last_substack_post(int $post_id): ?array
+    {
+        $stored = get_post_meta($post_id, self::SUBSTACK_POST_META_KEY, true);
+
+        return is_array($stored)
+            && is_array($stored['bylines'] ?? null)
+            && is_string($stored['cover_image'] ?? null)
+            && is_bool($stored['has_video'] ?? null)
+            ? $stored
+            : null;
+    }
+
+    private function remember_substack_post(int $post_id, ?array $substack): void
+    {
+        if ($substack !== null) {
+            update_post_meta($post_id, self::SUBSTACK_POST_META_KEY, wp_slash($substack));
+        }
+    }
+
+    /**
+     * The API URL for a post on the configured publication, or ''. Pinned to the
+     * feed's host so a link inside the feed cannot choose where requests go.
+     */
+    private function substack_post_api_url(string $permalink): string
+    {
+        $feed_host = strtolower((string) wp_parse_url((string) ($this->settings['feed_url'] ?? ''), PHP_URL_HOST));
+        $host = strtolower((string) wp_parse_url($permalink, PHP_URL_HOST));
+        $path = (string) wp_parse_url($permalink, PHP_URL_PATH);
+
+        if ($feed_host === '' || $host !== $feed_host || ! preg_match('#^/p/([A-Za-z0-9-]+)/?$#', $path, $matches)) {
+            return '';
+        }
+
+        return 'https://' . $host . '/api/v1/posts/' . $matches[1];
+    }
+
+    /**
+     * @param array<string, mixed> $data The decoded API response.
+     * @return array{bylines: list<string>, cover_image: string, has_video: bool}
+     */
+    private function normalize_substack_post(array $data): array
+    {
+        $bylines = [];
+        foreach ((array) ($data['publishedBylines'] ?? []) as $byline) {
+            $name = is_array($byline) && is_string($byline['name'] ?? null) ? trim(sanitize_text_field($byline['name'])) : '';
+            if ($name !== '' && ! in_array($name, $bylines, true)) {
+                $bylines[] = $name;
+            }
+        }
+
+        return [
+            'bylines' => $bylines,
+            'cover_image' => is_string($data['cover_image'] ?? null) ? $data['cover_image'] : '',
+            'has_video' => ! empty($data['video_upload_id']) || ! empty($data['videoUpload']),
+        ];
+    }
+
+    /**
+     * File the post under its bylines. The feed's dc:creator names only the first
+     * byline, so without the API it fills an empty list and never replaces one.
+     */
+    private function assign_bylines(int $post_id, $item, ?array $substack): void
+    {
+        if ($substack !== null) {
+            $names = $substack['bylines'];
+        } elseif (! has_term('', self::BYLINE_TAXONOMY, $post_id)) {
+            $names = [];
+            foreach ((array) ($item->get_authors() ?? []) as $author) {
+                $name = is_object($author) ? trim(sanitize_text_field((string) $author->get_name())) : '';
+                if ($name !== '') {
+                    $names[] = $name;
+                }
+            }
+
+            if ($names === []) {
+                return;
+            }
+        } else {
+            return;
+        }
+
+        $result = wp_set_object_terms($post_id, wp_slash($names), self::BYLINE_TAXONOMY);
+        if (is_wp_error($result)) {
+            error_log('Substack Sync: could not set bylines - ' . $result->get_error_message());
+        }
+    }
+
+    /**
      * One-time backfill of the Substack source-URL meta for posts imported
      * before store_source_url() existed. The sync-log table already holds the
      * Substack GUID (which, for Substack feeds, is the post URL) keyed to
@@ -1630,18 +2144,10 @@ class Substack_Sync_Processor
      * through 1.3.1: the rewrite shipped in 1.3.0 but matched on an iframe that
      * fetch_feed() had already stripped, so it never fired on an imported post.
      *
-     * Those posts had no <img> at all in their stored content, because kses had
-     * eaten the iframe, so process_post_images() took the featured image from
-     * whatever body photo appeared further down. A later sync rewrites their
-     * content to lead with the video thumbnail but cannot fix the thumbnail
-     * itself: set_post_thumbnail() is gated on ! has_post_thumbnail(), which is
-     * what stops ordinary syncs from overriding an image an editor chose.
-     *
-     * Only posts still in the feed can be repaired, since the repair matches on
-     * content a sync rewrote. A video post that has aged out of the feed keeps
-     * its wrong featured image and needs its featured image set by hand: no sync
-     * reprocesses a post the feed no longer carries, so clearing the thumbnail
-     * only leaves the post without one.
+     * It matches on the linked-thumbnail figure 1.3.2 and 1.3.3 wrote. Since 1.4.0
+     * a sync writes a player instead and sets the Substack cover itself, so this
+     * reaches only posts that left the feed carrying a figure. Edited posts are
+     * a person's to fix and are skipped.
      *
      * Idempotent and option-flag gated, like backfill_source_urls(), but unlike
      * that pass this one can find work it is not yet able to finish, so the flag
@@ -1683,7 +2189,7 @@ class Substack_Sync_Processor
 
         foreach ($rows as $row) {
             $post_id = (int) ($row['post_id'] ?? 0);
-            if ($post_id <= 0) {
+            if ($post_id <= 0 || self::is_edited_in_wordpress($post_id)) {
                 continue;
             }
 
@@ -1934,6 +2440,12 @@ class Substack_Sync_Processor
             $this->rearm_video_thumbnail_repair();
         }
 
+        // WordPress rebuilds deleted rules on the next request that needs them,
+        // after init has registered the taxonomy whose archives they route.
+        if (version_compare($stored, self::BYLINE_TAXONOMY_VERSION, '<')) {
+            delete_option('rewrite_rules');
+        }
+
         update_option(self::UPGRADED_VERSION_OPTION, $version);
     }
 
@@ -2008,9 +2520,8 @@ class Substack_Sync_Processor
      * is not a video frame.
      *
      * "Leading" is the whole point: this fires only when the video figure holds
-     * the post's first image, which is the rule process_post_images() already
-     * applies when picking a featured image, so the repair can never promote a
-     * video frame past a photo that legitimately comes first.
+     * the post's first image, so the repair can never promote a video frame past
+     * a photo that legitimately comes first.
      *
      * Deliberately stops at the ID rather than resolving the attachment: the
      * caller has to tell "this post needs no repair" apart from "this post
@@ -2144,11 +2655,10 @@ class Substack_Sync_Processor
     }
 
     /**
-     * Whether the repair may replace a post's current featured image.
+     * Whether a sync's cover or the repair may replace a post's featured image.
      *
-     * Ordinary syncs are gated on ! has_post_thumbnail() so an image from
-     * outside this plugin survives; the pass runs without that gate, so it needs
-     * its own. The gate is narrower than "never override a person": an
+     * Neither is gated on ! has_post_thumbnail(), so both need this. The gate is
+     * narrower than "never override a person": an
      * attachment carrying a source URL is one this plugin sideloaded, and an
      * editor who picked a different Substack body photo out of the library is
      * indistinguishable from the plugin having set it. Uploads from anywhere
